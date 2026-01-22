@@ -1,0 +1,280 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ============================================
+    // HELPER FUNCTIONS
+    // ============================================
+
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Get the current user's ID
+    function userId() {
+      return request.auth.uid;
+    }
+
+    // Check if the requesting user is the document owner
+    function isOwner(ownerId) {
+      return isAuthenticated() && userId() == ownerId;
+    }
+
+    // Check if a field exists and is a string with valid length
+    function isValidString(field, minLen, maxLen) {
+      return field is string && field.size() >= minLen && field.size() <= maxLen;
+    }
+
+    // Check if latitude is valid (-90 to 90)
+    function isValidLatitude(lat) {
+      return lat is number && lat >= -90 && lat <= 90;
+    }
+
+    // Check if longitude is valid (-180 to 180)
+    function isValidLongitude(lng) {
+      return lng is number && lng >= -180 && lng <= 180;
+    }
+
+    // ============================================
+    // USERS COLLECTION
+    // ============================================
+
+    match /users/{userDocId} {
+      // Users can read their own document
+      // Other authenticated users can read for friend search (usernameTag, displayName, discriminator)
+      allow read: if isAuthenticated();
+
+      // Users can only create their own document
+      // displayName validation only required if displayName is provided
+      allow create: if isOwner(userDocId)
+        && (!('displayName' in request.resource.data) || isValidString(request.resource.data.displayName, 1, 50));
+
+      // Users can only update their own document
+      allow update: if isOwner(userDocId);
+
+      // Users can only delete their own document
+      allow delete: if isOwner(userDocId);
+
+      // Achievements subcollection - users can only access their own
+      match /achievements/{achievementId} {
+        allow read: if isOwner(userDocId);
+        allow create, update: if isOwner(userDocId)
+          && request.resource.data.userId == userId();
+        allow delete: if isOwner(userDocId);
+      }
+
+      // Stats subcollection - users can only access their own
+      match /stats/{statId} {
+        allow read: if isOwner(userDocId);
+        allow create, update: if isOwner(userDocId);
+        allow delete: if isOwner(userDocId);
+      }
+
+      // Friends subcollection - users can only access their own friends
+      match /friends/{friendId} {
+        allow read, write: if isOwner(userDocId);
+      }
+    }
+
+    // ============================================
+    // FRIEND REQUESTS COLLECTION
+    // ============================================
+
+    match /friendRequests/{requestId} {
+      // Sender or receiver can read the request
+      allow read: if isAuthenticated()
+        && (userId() == resource.data.senderId || userId() == resource.data.receiverId);
+
+      // Authenticated users can create friend requests (must be the sender)
+      allow create: if isAuthenticated()
+        && request.resource.data.senderId == userId()
+        && isValidString(request.resource.data.senderName, 1, 50)
+        && isValidString(request.resource.data.senderTag, 1, 60)
+        && request.resource.data.status == 'pending';
+
+      // Only the receiver can update (accept/decline) the request
+      allow update: if isAuthenticated()
+        && userId() == resource.data.receiverId
+        && request.resource.data.senderId == resource.data.senderId
+        && request.resource.data.receiverId == resource.data.receiverId;
+
+      // Sender or receiver can delete the request
+      allow delete: if isAuthenticated()
+        && (userId() == resource.data.senderId || userId() == resource.data.receiverId);
+    }
+
+    // ============================================
+    // GROUPS COLLECTION
+    // ============================================
+
+    match /groups/{groupId} {
+      // Helper: Check if user is a member of this group
+      function isMember() {
+        return isAuthenticated() && userId() in resource.data.memberIds;
+      }
+
+      // Helper: Check if user is the owner of this group
+      function isGroupOwner() {
+        return isAuthenticated() && userId() == resource.data.ownerId;
+      }
+
+      // Helper: Check if user will be a member after update
+      function willBeMember() {
+        return isAuthenticated() && userId() in request.resource.data.memberIds;
+      }
+
+      // Helper: Validate group data
+      function isValidGroupData() {
+        let data = request.resource.data;
+        return isValidString(data.name, 1, 100)
+          && data.isPublic is bool
+          && data.boundary is list
+          && data.boundary.size() >= 3
+          && data.boundary.size() <= 100
+          && isValidLatitude(data.centerLatitude)
+          && isValidLongitude(data.centerLongitude);
+      }
+
+      // Public groups: anyone authenticated can read
+      // Private groups: only members can read
+      allow read: if isAuthenticated()
+        && (resource.data.isPublic == true || isMember());
+
+      // Any authenticated user can create a group
+      // They must set themselves as the owner and first member
+      allow create: if isAuthenticated()
+        && request.resource.data.ownerId == userId()
+        && userId() in request.resource.data.memberIds
+        && isValidGroupData();
+
+      // Members can update to join/leave (modify memberIds)
+      // Owner can update group settings
+      allow update: if isAuthenticated()
+        && (
+          // Owner can update anything except changing ownership
+          (isGroupOwner() && request.resource.data.ownerId == resource.data.ownerId && isValidGroupData())
+          ||
+          // Members can only modify memberIds (to leave)
+          (isMember()
+            && request.resource.data.name == resource.data.name
+            && request.resource.data.isPublic == resource.data.isPublic
+            && request.resource.data.ownerId == resource.data.ownerId
+            && request.resource.data.boundary == resource.data.boundary
+            && request.resource.data.centerLatitude == resource.data.centerLatitude
+            && request.resource.data.centerLongitude == resource.data.centerLongitude)
+          ||
+          // Any authenticated user can join a public group
+          (resource.data.isPublic == true
+            && willBeMember()
+            && request.resource.data.name == resource.data.name
+            && request.resource.data.isPublic == resource.data.isPublic
+            && request.resource.data.ownerId == resource.data.ownerId
+            && request.resource.data.boundary == resource.data.boundary
+            && request.resource.data.centerLatitude == resource.data.centerLatitude
+            && request.resource.data.centerLongitude == resource.data.centerLongitude)
+        );
+
+      // Only the owner can delete a group
+      allow delete: if isGroupOwner();
+
+      // Messages subcollection - group chat
+      match /messages/{messageId} {
+        // Helper: Check if user is a member of the parent group
+        function isGroupMember() {
+          let groupDoc = get(/databases/$(database)/documents/groups/$(groupId));
+          return isAuthenticated() && userId() in groupDoc.data.memberIds;
+        }
+
+        // Helper: Check if message is valid
+        function isValidMessage() {
+          let data = request.resource.data;
+          return isValidString(data.text, 1, 500)
+            && data.senderId == userId()
+            && isValidString(data.senderName, 1, 50)
+            && data.groupId == groupId
+            && data.createdAt is timestamp;
+        }
+
+        // Members can read messages
+        allow read: if isGroupMember();
+
+        // Members can create messages (must be their own)
+        allow create: if isGroupMember() && isValidMessage();
+
+        // Users can only delete their own messages
+        allow delete: if isAuthenticated() && resource.data.senderId == userId();
+
+        // No updates allowed - messages are immutable
+        allow update: if false;
+      }
+
+      // Daily first arrival tracking for Early Bird achievement
+      match /daily_first_arrival/{dateId} {
+        // Helper: Check if user is a member of the parent group
+        function isGroupMemberForArrival() {
+          let groupDoc = get(/databases/$(database)/documents/groups/$(groupId));
+          return isAuthenticated() && userId() in groupDoc.data.memberIds;
+        }
+
+        // Members can read to check if someone claimed first arrival
+        allow read: if isGroupMemberForArrival();
+
+        // Members can create only if doc doesn't exist (handled by transaction)
+        // and must claim for themselves
+        allow create: if isGroupMemberForArrival()
+          && request.resource.data.userId == userId();
+
+        // No updates or deletes - once claimed, it's permanent for that day
+        allow update, delete: if false;
+      }
+    }
+
+    // ============================================
+    // PRESENCE COLLECTION
+    // ============================================
+
+    match /presence/{groupId} {
+      // Allow read if user can access the parent group
+      allow read: if isAuthenticated();
+
+      match /members/{memberId} {
+        // Users can only read presence for groups they're members of
+        // or public groups
+        allow read: if isAuthenticated();
+
+        // Users can only write their own presence
+        allow create, update: if isOwner(memberId)
+          && request.resource.data.userId == userId()
+          && request.resource.data.groupId == groupId
+          && request.resource.data.isPresent is bool
+          && request.resource.data.isManual is bool;
+
+        // Users can only delete their own presence
+        allow delete: if isOwner(memberId);
+      }
+    }
+
+    // ============================================
+    // COUNTERS COLLECTION (for sequential IDs)
+    // ============================================
+
+    match /counters/{counterId} {
+      // Allow authenticated users to read and update counters
+      // Used for sequential discriminator generation
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated();
+      allow delete: if false;  // Never delete counters
+    }
+
+    // ============================================
+    // DEFAULT: DENY ALL
+    // ============================================
+
+    // Deny access to any other collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

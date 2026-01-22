@@ -1,0 +1,177 @@
+//
+//  NotificationService.swift
+//  WhosThereios
+//
+//  Created by Claude on 1/20/26.
+//
+
+import Foundation
+import UserNotifications
+import FirebaseAuth
+import FirebaseFirestore
+import Combine
+
+@MainActor
+class NotificationService: NSObject, ObservableObject {
+    static let shared = NotificationService()
+
+    private let db = Firestore.firestore()
+    private var firestoreService: FirestoreService { FirestoreService.shared }
+
+    @Published var isAuthorized = false
+    @Published var fcmToken: String?
+
+    override init() {
+        super.init()
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    // MARK: - Permission Handling
+
+    func requestPermissions() async -> Bool {
+        do {
+            let options: UNAuthorizationOptions = [.alert, .badge, .sound]
+            let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: options)
+            isAuthorized = granted
+
+            if granted {
+                await registerForRemoteNotifications()
+            }
+
+            return granted
+        } catch {
+            print("Error requesting notification permission: \(error)")
+            return false
+        }
+    }
+
+    func checkAuthorizationStatus() async {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        isAuthorized = settings.authorizationStatus == .authorized
+    }
+
+    private func registerForRemoteNotifications() async {
+        await MainActor.run {
+            UIApplication.shared.registerForRemoteNotifications()
+        }
+    }
+
+    // MARK: - Token Management
+
+    func updateFCMToken(_ token: String) async {
+        self.fcmToken = token
+
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        do {
+            try await db.collection("users").document(userId).setData([
+                "fcmToken": token
+            ], merge: true)
+            print("FCM token updated in Firestore")
+        } catch {
+            print("Error updating FCM token: \(error)")
+        }
+    }
+
+    func clearFCMToken() async {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        do {
+            try await db.collection("users").document(userId).updateData([
+                "fcmToken": FieldValue.delete()
+            ])
+            fcmToken = nil
+            print("FCM token cleared")
+        } catch {
+            print("Error clearing FCM token: \(error)")
+        }
+    }
+
+    // MARK: - Local Notifications (for testing/fallback)
+
+    func sendLocalNotification(title: String, body: String, groupId: String? = nil) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+
+        if let groupId = groupId {
+            content.userInfo = ["groupId": groupId]
+        }
+
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: trigger
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error = error {
+                print("Error sending local notification: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Friend Arrival Notification
+
+    func notifyFriendArrival(friendName: String, groupName: String, groupEmoji: String, groupId: String) {
+        sendLocalNotification(
+            title: "\(groupEmoji) \(friendName) arrived!",
+            body: "\(friendName) just checked in at \(groupName)",
+            groupId: groupId
+        )
+    }
+
+    // MARK: - Friend Request Notification
+
+    func notifyFriendRequest(senderName: String) {
+        sendLocalNotification(
+            title: "New Friend Request",
+            body: "\(senderName) wants to be your friend"
+        )
+    }
+
+    // MARK: - Handle Received Notification
+
+    func handleNotification(_ userInfo: [AnyHashable: Any]) {
+        // Handle notification tap
+        if let groupId = userInfo["groupId"] as? String {
+            // Navigate to group
+            NotificationCenter.default.post(
+                name: .openGroup,
+                object: nil,
+                userInfo: ["groupId": groupId]
+            )
+        }
+    }
+}
+
+// MARK: - UNUserNotificationCenterDelegate
+
+extension NotificationService: UNUserNotificationCenterDelegate {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        // Show notification even when app is in foreground
+        return [.banner, .sound, .badge]
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse
+    ) async {
+        let userInfo = response.notification.request.content.userInfo
+        await MainActor.run {
+            handleNotification(userInfo)
+        }
+    }
+}
+
+// MARK: - Notification Names
+
+extension Notification.Name {
+    static let openGroup = Notification.Name("openGroup")
+    static let friendRequestReceived = Notification.Name("friendRequestReceived")
+}
