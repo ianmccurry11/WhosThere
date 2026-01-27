@@ -602,6 +602,45 @@ class FirestoreService: ObservableObject {
         }
     }
 
+    func updateGroupBoundary(groupId: String, boundary: [Coordinate]) async {
+        // Validate boundary before saving
+        let validationResult = Validation.validateBoundary(boundary)
+        guard validationResult.isValid else {
+            print("Invalid boundary: \(validationResult.error?.userMessage ?? "Unknown error")")
+            return
+        }
+
+        // Calculate new center coordinates
+        let latitudes = boundary.map { $0.latitude }
+        let longitudes = boundary.map { $0.longitude }
+        let centerLat = (latitudes.min()! + latitudes.max()!) / 2
+        let centerLon = (longitudes.min()! + longitudes.max()!) / 2
+
+        // Convert boundary to Firestore format
+        let boundaryData = boundary.map { ["latitude": $0.latitude, "longitude": $0.longitude] }
+
+        do {
+            try await db.collection("groups").document(groupId).updateData([
+                "boundary": boundaryData,
+                "centerLatitude": centerLat,
+                "centerLongitude": centerLon
+            ])
+
+            // Update geofencing for this group
+            await updateGeofenceForGroup(groupId: groupId, boundary: boundary)
+
+            print("Group boundary updated successfully")
+        } catch {
+            print("Error updating group boundary: \(error)")
+        }
+    }
+
+    private func updateGeofenceForGroup(groupId: String, boundary: [Coordinate]) async {
+        // Notify LocationService to update geofencing
+        let coordinates = boundary.map { CLLocationCoordinate2D(latitude: $0.latitude, longitude: $0.longitude) }
+        await LocationService.shared.updateGeofenceForGroup(groupId: groupId, coordinates: coordinates)
+    }
+
     func findGroupByInviteCode(_ code: String) async -> LocationGroup? {
         do {
             let snapshot = try await db.collection("groups")

@@ -124,6 +124,56 @@ class LocationService: NSObject, ObservableObject {
         isMonitoring = false
     }
 
+    func updateGeofenceForGroup(groupId: String, coordinates: [CLLocationCoordinate2D]) async {
+        // Only update if we're actively monitoring
+        guard isMonitoring, authorizationStatus == .authorizedAlways else { return }
+
+        // Stop monitoring the old region for this group
+        for region in locationManager.monitoredRegions where region.identifier == groupId {
+            locationManager.stopMonitoring(for: region)
+        }
+
+        // Calculate new center and radius from coordinates
+        guard !coordinates.isEmpty else { return }
+
+        let latitudes = coordinates.map { $0.latitude }
+        let longitudes = coordinates.map { $0.longitude }
+        let centerLat = (latitudes.min()! + latitudes.max()!) / 2
+        let centerLon = (longitudes.min()! + longitudes.max()!) / 2
+        let center = CLLocationCoordinate2D(latitude: centerLat, longitude: centerLon)
+
+        // Calculate radius as max distance from center to any boundary point
+        let centerLocation = CLLocation(latitude: centerLat, longitude: centerLon)
+        var maxDistance: CLLocationDistance = 0
+        for coord in coordinates {
+            let pointLocation = CLLocation(latitude: coord.latitude, longitude: coord.longitude)
+            let distance = centerLocation.distance(from: pointLocation)
+            maxDistance = max(maxDistance, distance)
+        }
+
+        // Add padding and enforce limits
+        let radius = min(max(maxDistance * 1.1, 50), locationManager.maximumRegionMonitoringDistance)
+
+        // Create and monitor new region
+        let region = CLCircularRegion(
+            center: center,
+            radius: radius,
+            identifier: groupId
+        )
+        region.notifyOnEntry = true
+        region.notifyOnExit = true
+
+        locationManager.startMonitoring(for: region)
+
+        // Update the cached group if we have it
+        if var cachedGroup = monitoredGroups[groupId] {
+            cachedGroup.boundary = coordinates.map { Coordinate(from: $0) }
+            monitoredGroups[groupId] = cachedGroup
+        }
+
+        print("Updated geofence for group \(groupId) - center: \(center), radius: \(radius)m")
+    }
+
     func checkPresenceInGroups(_ groups: [LocationGroup]) -> [String: Bool] {
         guard let currentLoc = currentLocation else { return [:] }
 
