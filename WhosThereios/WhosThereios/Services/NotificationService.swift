@@ -9,6 +9,7 @@ import Foundation
 import UserNotifications
 import FirebaseAuth
 import FirebaseFirestore
+import FirebaseMessaging
 import Combine
 
 @MainActor
@@ -24,6 +25,15 @@ class NotificationService: NSObject, ObservableObject {
     override init() {
         super.init()
         UNUserNotificationCenter.current().delegate = self
+        Messaging.messaging().delegate = self
+    }
+
+    // MARK: - Setup
+
+    func configure() {
+        Task {
+            await checkAuthorizationStatus()
+        }
     }
 
     // MARK: - Permission Handling
@@ -48,6 +58,10 @@ class NotificationService: NSObject, ObservableObject {
     func checkAuthorizationStatus() async {
         let settings = await UNUserNotificationCenter.current().notificationSettings()
         isAuthorized = settings.authorizationStatus == .authorized
+
+        if isAuthorized {
+            await registerForRemoteNotifications()
+        }
     }
 
     private func registerForRemoteNotifications() async {
@@ -84,6 +98,55 @@ class NotificationService: NSObject, ObservableObject {
             print("FCM token cleared")
         } catch {
             print("Error clearing FCM token: \(error)")
+        }
+    }
+
+    // MARK: - APNs Token (called from AppDelegate)
+
+    func setAPNsToken(_ deviceToken: Data) {
+        Messaging.messaging().apnsToken = deviceToken
+    }
+
+    // MARK: - Notification Preferences
+
+    func getNotificationPreferences(groupId: String) async -> NotificationPreferences? {
+        guard let userId = Auth.auth().currentUser?.uid else { return nil }
+
+        do {
+            let doc = try await db.collection("users").document(userId)
+                .collection("notificationPreferences").document(groupId).getDocument()
+
+            if doc.exists {
+                return try doc.data(as: NotificationPreferences.self)
+            }
+            return nil
+        } catch {
+            print("Error fetching notification preferences: \(error)")
+            return nil
+        }
+    }
+
+    func updateNotificationPreferences(groupId: String, preferences: NotificationPreferences) async {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        do {
+            try db.collection("users").document(userId)
+                .collection("notificationPreferences").document(groupId)
+                .setData(from: preferences, merge: true)
+            print("Notification preferences updated for group: \(groupId)")
+        } catch {
+            print("Error updating notification preferences: \(error)")
+        }
+    }
+
+    func deleteNotificationPreferences(groupId: String) async {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        do {
+            try await db.collection("users").document(userId)
+                .collection("notificationPreferences").document(groupId).delete()
+        } catch {
+            print("Error deleting notification preferences: \(error)")
         }
     }
 
@@ -165,6 +228,19 @@ extension NotificationService: UNUserNotificationCenterDelegate {
         let userInfo = response.notification.request.content.userInfo
         await MainActor.run {
             handleNotification(userInfo)
+        }
+    }
+}
+
+// MARK: - MessagingDelegate
+
+extension NotificationService: MessagingDelegate {
+    nonisolated func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+        guard let token = fcmToken else { return }
+        print("FCM token received: \(token)")
+
+        Task { @MainActor in
+            await self.updateFCMToken(token)
         }
     }
 }

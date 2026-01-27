@@ -11,6 +11,7 @@ import MapKit
 struct GroupSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject private var firestoreService = FirestoreService.shared
+    @ObservedObject private var notificationService = NotificationService.shared
 
     let group: LocationGroup
 
@@ -24,6 +25,13 @@ struct GroupSettingsView: View {
     // Boundary editing state
     @State private var boundaryPoints: [CLLocationCoordinate2D] = []
     @State private var hasModifiedBoundary = false
+
+    // Notification preferences state
+    @State private var notifyArrivals = true
+    @State private var notifyDepartures = false
+    @State private var notifyMessages = true
+    @State private var notificationsMuted = false
+    @State private var hasLoadedNotificationPrefs = false
 
     init(group: LocationGroup) {
         self.group = group
@@ -118,6 +126,27 @@ struct GroupSettingsView: View {
                     }
                 }
 
+                // Notification Settings Section
+                Section("Notifications") {
+                    Toggle("Mute All", isOn: $notificationsMuted)
+
+                    if !notificationsMuted {
+                        Toggle("Arrivals", isOn: $notifyArrivals)
+                        Toggle("Departures", isOn: $notifyDepartures)
+                        Toggle("Messages", isOn: $notifyMessages)
+                    }
+
+                    if notificationsMuted {
+                        Text("All notifications for this group are muted.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else if !notifyArrivals && !notifyDepartures && !notifyMessages {
+                        Text("No notifications enabled for this group.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
                 if let inviteCode = group.inviteCode {
                     Section("Invite Code") {
                         HStack {
@@ -162,7 +191,22 @@ struct GroupSettingsView: View {
                     }
                 )
             }
+            .task {
+                await loadNotificationPreferences()
+            }
         }
+    }
+
+    private func loadNotificationPreferences() async {
+        guard let groupId = group.id, !hasLoadedNotificationPrefs else { return }
+
+        if let prefs = await notificationService.getNotificationPreferences(groupId: groupId) {
+            notifyArrivals = prefs.arrivals
+            notifyDepartures = prefs.departures
+            notifyMessages = prefs.messages
+            notificationsMuted = prefs.muted
+        }
+        hasLoadedNotificationPrefs = true
     }
 
     private var mapPosition: MapCameraPosition {
@@ -201,6 +245,15 @@ struct GroupSettingsView: View {
             let coordinates = boundaryPoints.map { Coordinate(from: $0) }
             await firestoreService.updateGroupBoundary(groupId: groupId, boundary: coordinates)
         }
+
+        // Save notification preferences
+        let notificationPrefs = NotificationPreferences(
+            arrivals: notifyArrivals,
+            departures: notifyDepartures,
+            messages: notifyMessages,
+            muted: notificationsMuted
+        )
+        await notificationService.updateNotificationPreferences(groupId: groupId, preferences: notificationPrefs)
 
         await firestoreService.fetchJoinedGroups()
         isSaving = false

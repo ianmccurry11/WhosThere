@@ -10,6 +10,7 @@
 		810EE9042F18A0EE00E02198 /* FirebaseAuth in Frameworks */ = {isa = PBXBuildFile; productRef = 810EE9032F18A0EE00E02198 /* FirebaseAuth */; };
 		810EE9062F18A0EE00E02198 /* FirebaseCore in Frameworks */ = {isa = PBXBuildFile; productRef = 810EE9052F18A0EE00E02198 /* FirebaseCore */; };
 		810EE9082F18A0EE00E02198 /* FirebaseFirestore in Frameworks */ = {isa = PBXBuildFile; productRef = 810EE9072F18A0EE00E02198 /* FirebaseFirestore */; };
+		810EE90A2F18A0EE00E02198 /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = 810EE9092F18A0EE00E02198 /* FirebaseMessaging */; };
 		8118BA332F1FCC45004127C4 /* WhosThereWatch Watch App.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 8118BA322F1FCC45004127C4 /* WhosThereWatch Watch App.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
@@ -71,6 +72,7 @@
 				810EE9062F18A0EE00E02198 /* FirebaseCore in Frameworks */,
 				810EE9042F18A0EE00E02198 /* FirebaseAuth in Frameworks */,
 				810EE9082F18A0EE00E02198 /* FirebaseFirestore in Frameworks */,
+				810EE90A2F18A0EE00E02198 /* FirebaseMessaging in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -160,6 +162,7 @@
 				810EE9032F18A0EE00E02198 /* FirebaseAuth */,
 				810EE9052F18A0EE00E02198 /* FirebaseCore */,
 				810EE9072F18A0EE00E02198 /* FirebaseFirestore */,
+				810EE9092F18A0EE00E02198 /* FirebaseMessaging */,
 			);
 			productName = WhosThereios;
 			productReference = 81B79C532F1767B60043E756 /* WhosThereios.app */;
@@ -614,6 +617,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 810EE9022F18A0EE00E02198 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
 			productName = FirebaseFirestore;
+		};
+		810EE9092F18A0EE00E02198 /* FirebaseMessaging */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 810EE9022F18A0EE00E02198 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseMessaging;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

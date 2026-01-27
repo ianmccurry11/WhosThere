@@ -76,6 +76,17 @@ service cloud.firestore {
       match /friends/{friendId} {
         allow read, write: if isOwner(userDocId);
       }
+
+      // Notification preferences subcollection - users can only access their own
+      match /notificationPreferences/{groupId} {
+        allow read: if isOwner(userDocId);
+        allow create, update: if isOwner(userDocId)
+          && request.resource.data.arrivals is bool
+          && request.resource.data.departures is bool
+          && request.resource.data.messages is bool
+          && request.resource.data.muted is bool;
+        allow delete: if isOwner(userDocId);
+      }
     }
 
     // ============================================
