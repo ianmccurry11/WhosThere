@@ -20,6 +20,8 @@ struct ProfileView: View {
     @State private var showSignOutConfirmation = false
     @State private var showClearPresenceConfirmation = false
     @State private var selectedAutoCheckOutMinutes: Int = 60
+    @State private var showAnalyticsDashboard = false
+    @State private var versionTapCount = 0
 
     var body: some View {
         NavigationStack {
@@ -249,12 +251,7 @@ struct ProfileView: View {
 
                 // App Info
                 Section {
-                    HStack {
-                        Text("Version")
-                        Spacer()
-                        Text("1.0.0")
-                            .foregroundColor(.secondary)
-                    }
+                    versionRow
                 }
             }
             .navigationTitle("Profile")
@@ -289,6 +286,30 @@ struct ProfileView: View {
         .onAppear {
             // Load saved auto check-out time
             selectedAutoCheckOutMinutes = firestoreService.currentUser?.autoCheckOutMinutes ?? 60
+
+            // Track screen view
+            AnalyticsService.shared.trackScreenView("profile")
+        }
+        .sheet(isPresented: $showAnalyticsDashboard) {
+            AnalyticsDashboardView()
+        }
+    }
+
+    private var versionRow: some View {
+        HStack {
+            Text("Version")
+            Spacer()
+            Text("1.0.0")
+                .foregroundColor(.secondary)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            versionTapCount += 1
+            if versionTapCount >= 5 {
+                versionTapCount = 0
+                showAnalyticsDashboard = true
+                HapticManager.medium()
+            }
         }
     }
 

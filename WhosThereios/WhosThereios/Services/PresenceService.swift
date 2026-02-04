@@ -20,6 +20,10 @@ class PresenceService: ObservableObject {
     private var locationService: LocationService { LocationService.shared }
     private var firestoreService: FirestoreService { FirestoreService.shared }
     private var achievementService: AchievementService { AchievementService.shared }
+    private var analyticsService: AnalyticsService { AnalyticsService.shared }
+
+    /// Tracks check-in timestamps for duration calculation
+    private var checkInTimes: [String: Date] = [:]
 
     private var cancellables = Set<AnyCancellable>()
     private var presenceListeners: [String: Any] = [:]
@@ -86,6 +90,7 @@ class PresenceService: ObservableObject {
 
     func manualCheckIn(groupId: String) async {
         manualOverrides[groupId] = true
+        checkInTimes[groupId] = Date()
         await firestoreService.updatePresence(groupId: groupId, isPresent: true, isManual: true)
         await refreshPresence(groupId: groupId)
 
@@ -94,6 +99,9 @@ class PresenceService: ObservableObject {
             await achievementService.recordCheckIn(groupId: groupId, presentMembers: summary.presentMembers)
         }
 
+        // Track analytics
+        analyticsService.trackCheckIn(groupId: groupId, isManual: true)
+
         // Always start auto check-out timer for manual check-ins
         // Timer will be cancelled if user enters the geofence zone (geofencing takes over)
         print("[PresenceService] manualCheckIn - Starting timer for \(autoCheckOutMinutes) minutes")
@@ -101,9 +109,21 @@ class PresenceService: ObservableObject {
     }
 
     func manualCheckOut(groupId: String) async {
+        // Calculate duration
+        let durationMinutes: Int
+        if let checkInTime = checkInTimes[groupId] {
+            durationMinutes = Int(Date().timeIntervalSince(checkInTime) / 60)
+            checkInTimes.removeValue(forKey: groupId)
+        } else {
+            durationMinutes = 0
+        }
+
         manualOverrides[groupId] = false
         await firestoreService.updatePresence(groupId: groupId, isPresent: false, isManual: true)
         await refreshPresence(groupId: groupId)
+
+        // Track analytics
+        analyticsService.trackCheckOut(groupId: groupId, isManual: true, durationMinutes: durationMinutes)
 
         // Cancel any pending auto check-out timer
         cancelAutoCheckOutTimer(groupId: groupId)
@@ -135,7 +155,7 @@ class PresenceService: ObservableObject {
                 // Only auto check-out if timer is still active (user hasn't manually checked out)
                 if self.autoCheckOutTimers[groupId] != nil {
                     Task {
-                        await self.performAutoCheckOut(groupId: groupId)
+                        await self.performAutoCheckOut(groupId: groupId, reason: "timer")
                     }
                 }
             }
@@ -150,12 +170,26 @@ class PresenceService: ObservableObject {
         autoCheckOutTimers.removeValue(forKey: groupId)
     }
 
-    private func performAutoCheckOut(groupId: String) async {
-        print("Auto check-out triggered for group: \(groupId)")
+    private func performAutoCheckOut(groupId: String, reason: String = "timer") async {
+        print("Auto check-out triggered for group: \(groupId) (reason: \(reason))")
+
+        // Calculate duration
+        let durationMinutes: Int
+        if let checkInTime = checkInTimes[groupId] {
+            durationMinutes = Int(Date().timeIntervalSince(checkInTime) / 60)
+            checkInTimes.removeValue(forKey: groupId)
+        } else {
+            durationMinutes = 0
+        }
+
         manualOverrides.removeValue(forKey: groupId)
         autoCheckOutTimers.removeValue(forKey: groupId)
         await firestoreService.updatePresence(groupId: groupId, isPresent: false, isManual: false)
         await refreshPresence(groupId: groupId)
+
+        // Track analytics
+        analyticsService.trackAutoCheckOut(groupId: groupId, reason: reason)
+        analyticsService.trackCheckOut(groupId: groupId, isManual: false, durationMinutes: durationMinutes)
     }
 
     /// Returns the remaining time until auto check-out for a group, or nil if no timer is active
@@ -195,6 +229,7 @@ class PresenceService: ObservableObject {
         }
 
         lastAutoUpdate[groupId] = Date()
+        checkInTimes[groupId] = Date()
         await firestoreService.updatePresence(groupId: groupId, isPresent: true, isManual: false)
         await refreshPresence(groupId: groupId)
 
@@ -202,6 +237,9 @@ class PresenceService: ObservableObject {
         if let summary = presenceByGroup[groupId] {
             await achievementService.recordCheckIn(groupId: groupId, presentMembers: summary.presentMembers)
         }
+
+        // Track analytics
+        analyticsService.trackCheckIn(groupId: groupId, isManual: false)
     }
 
     private func handleRegionExit(groupId: String) async {
@@ -210,9 +248,21 @@ class PresenceService: ObservableObject {
             return
         }
 
+        // Calculate duration
+        let durationMinutes: Int
+        if let checkInTime = checkInTimes[groupId] {
+            durationMinutes = Int(Date().timeIntervalSince(checkInTime) / 60)
+            checkInTimes.removeValue(forKey: groupId)
+        } else {
+            durationMinutes = 0
+        }
+
         lastAutoUpdate[groupId] = Date()
         await firestoreService.updatePresence(groupId: groupId, isPresent: false, isManual: false)
         await refreshPresence(groupId: groupId)
+
+        // Track analytics
+        analyticsService.trackCheckOut(groupId: groupId, isManual: false, durationMinutes: durationMinutes)
     }
 
     func checkAndUpdateAllPresence(groups: [LocationGroup]) async {
@@ -264,7 +314,7 @@ class PresenceService: ObservableObject {
             if let userPresence = summary.presentMembers.first(where: { $0.userId == userId }) {
                 if isPresenceStale(userPresence) {
                     print("Stale presence detected for user in group: \(groupId)")
-                    await performAutoCheckOut(groupId: groupId)
+                    await performAutoCheckOut(groupId: groupId, reason: "stale")
                 }
             }
         }
@@ -299,7 +349,7 @@ class PresenceService: ObservableObject {
         if let userPresence = presences.first(where: { $0.userId == userId && $0.isPresent }) {
             if isPresenceStale(userPresence) {
                 print("Auto check-out: User presence stale in group \(groupId) (> 10 hours)")
-                await performAutoCheckOut(groupId: groupId)
+                await performAutoCheckOut(groupId: groupId, reason: "stale")
             }
         }
     }

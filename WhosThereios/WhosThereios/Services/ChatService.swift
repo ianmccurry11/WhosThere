@@ -15,6 +15,7 @@ class ChatService: ObservableObject {
     private let db = Firestore.firestore()
     private var messageListener: ListenerRegistration?
     private var lastMessageTime: Date?
+    private var analyticsService: AnalyticsService { AnalyticsService.shared }
 
     @Published var messages: [Message] = []
     @Published var isLoading = false
@@ -118,6 +119,9 @@ class ChatService: ObservableObject {
             lastMessageTime = Date()
             error = nil
 
+            // Track analytics
+            analyticsService.trackMessageSent(groupId: groupId, messageLength: trimmedText.count)
+
             // Cleanup old messages in background
             Task {
                 await cleanupOldMessages()
@@ -126,6 +130,7 @@ class ChatService: ObservableObject {
             return true
         } catch {
             self.error = "Failed to send message: \(error.localizedDescription)"
+            analyticsService.trackError(errorType: "message_send_failed", context: "ChatService.sendMessage", message: error.localizedDescription)
             return false
         }
     }

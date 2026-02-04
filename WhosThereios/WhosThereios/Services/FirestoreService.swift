@@ -26,6 +26,7 @@ class FirestoreService: ObservableObject {
     private var groupsListener: ListenerRegistration?
     private var presenceListeners: [String: ListenerRegistration] = [:]
     private var achievementService: AchievementService { AchievementService.shared }
+    private var analyticsService: AnalyticsService { AnalyticsService.shared }
 
     // MARK: - Error Handling
 
@@ -42,7 +43,10 @@ class FirestoreService: ObservableObject {
 
     // MARK: - User Operations
 
-    func createUserIfNeeded(userId: String, displayName: String, email: String?) async {
+    /// Creates a user document if it doesn't exist
+    /// - Returns: true if a new user was created, false if user already existed
+    @discardableResult
+    func createUserIfNeeded(userId: String, displayName: String, email: String?) async -> Bool {
         let userRef = db.collection("users").document(userId)
 
         do {
@@ -63,6 +67,7 @@ class FirestoreService: ObservableObject {
                 )
                 try userRef.setData(from: newUser)
                 self.currentUser = newUser
+                return true
             } else {
                 self.currentUser = try document.data(as: User.self)
 
@@ -70,9 +75,11 @@ class FirestoreService: ObservableObject {
                 if self.currentUser?.needsDiscriminatorMigration == true {
                     await migrateUserDiscriminator()
                 }
+                return false
             }
         } catch {
             print("Error creating user: \(error)")
+            return false
         }
     }
 
@@ -336,12 +343,20 @@ class FirestoreService: ObservableObject {
             // Track achievement for creating a group
             await achievementService.recordGroupCreated()
 
+            // Track analytics
+            analyticsService.trackGroupCreated(
+                groupId: groupId,
+                hasBoundary: !validatedGroup.boundary.isEmpty,
+                isPublic: validatedGroup.isPublic
+            )
+
             print("[FirestoreService] Group creation complete, returning success")
             return .success(groupId)
         } catch {
             print("[FirestoreService] Group creation failed with error: \(error)")
             let appError = AppError.groupCreationFailed(underlying: error)
             handleError(appError)
+            analyticsService.trackError(errorType: "group_creation_failed", context: "FirestoreService.createGroup", message: error.localizedDescription)
             return .failure(appError)
         }
     }
@@ -479,10 +494,14 @@ class FirestoreService: ObservableObject {
             // Track achievement for joining a group
             await achievementService.recordGroupJoined()
 
+            // Track analytics
+            analyticsService.trackGroupJoined(groupId: groupId, joinMethod: "direct")
+
             return .success(())
         } catch {
             let appError = AppError.groupUpdateFailed(underlying: error)
             handleError(appError)
+            analyticsService.trackError(errorType: "group_join_failed", context: "FirestoreService.joinGroup", message: error.localizedDescription)
             return .failure(appError)
         }
     }
@@ -526,10 +545,14 @@ class FirestoreService: ObservableObject {
             // Fetch updated data
             await fetchJoinedGroups()
 
+            // Track analytics
+            analyticsService.trackGroupLeft(groupId: groupId, wasOwner: false)
+
             return .success(())
         } catch {
             let appError = AppError.groupUpdateFailed(underlying: error)
             handleError(appError)
+            analyticsService.trackError(errorType: "group_leave_failed", context: "FirestoreService.leaveGroup", message: error.localizedDescription)
             return .failure(appError)
         }
     }
@@ -582,10 +605,14 @@ class FirestoreService: ObservableObject {
             await fetchJoinedGroups()
             await fetchPublicGroups()
 
+            // Track analytics
+            analyticsService.trackGroupDeleted(groupId: groupId, memberCount: group.memberIds.count)
+
             return .success(())
         } catch {
             let appError = AppError.groupDeletionFailed(underlying: error)
             handleError(appError)
+            analyticsService.trackError(errorType: "group_deletion_failed", context: "FirestoreService.deleteGroup", message: error.localizedDescription)
             return .failure(appError)
         }
     }

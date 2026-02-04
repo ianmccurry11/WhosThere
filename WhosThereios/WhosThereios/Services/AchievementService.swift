@@ -16,6 +16,7 @@ class AchievementService: ObservableObject {
 
     private let db = Firestore.firestore()
     private var firestoreService: FirestoreService { FirestoreService.shared }
+    private var analyticsService: AnalyticsService { AnalyticsService.shared }
 
     @Published var earnedAchievements: [UserAchievement] = []
     @Published var userStats: UserStats = UserStats()
@@ -335,6 +336,12 @@ class AchievementService: ObservableObject {
 
             // Haptic feedback for achievement unlock
             HapticManager.success()
+
+            // Track analytics
+            analyticsService.trackAchievementUnlocked(
+                achievementType: achievement.rawValue,
+                points: achievement.points
+            )
 
             print("Achievement unlocked: \(achievement.displayName)")
 

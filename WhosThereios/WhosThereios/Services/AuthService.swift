@@ -20,6 +20,7 @@ class AuthService: NSObject, ObservableObject {
 
     private var authStateHandler: AuthStateDidChangeListenerHandle?
     private var currentNonce: String?
+    private var analyticsService: AnalyticsService { AnalyticsService.shared }
 
     override init() {
         super.init()
@@ -46,21 +47,29 @@ class AuthService: NSObject, ObservableObject {
         isLoading = true
         errorMessage = nil
 
+        analyticsService.trackSignInAttempted(method: "anonymous")
+
         do {
             let result = try await Auth.auth().signInAnonymously()
             self.user = result.user
             self.isAuthenticated = true
 
             // Create user document
+            let isNewUser: Bool
             if let userId = self.user?.uid {
-                await FirestoreService.shared.createUserIfNeeded(
+                isNewUser = await FirestoreService.shared.createUserIfNeeded(
                     userId: userId,
                     displayName: "Player \(String(userId.prefix(4)))",
                     email: nil
                 )
+            } else {
+                isNewUser = false
             }
+
+            analyticsService.trackSignInSuccess(method: "anonymous", isNewUser: isNewUser)
         } catch {
             self.errorMessage = error.localizedDescription
+            analyticsService.trackSignInFailure(method: "anonymous", errorCode: String(describing: error))
         }
 
         isLoading = false
@@ -71,8 +80,10 @@ class AuthService: NSObject, ObservableObject {
             try Auth.auth().signOut()
             user = nil
             isAuthenticated = false
+            analyticsService.trackSignOut()
         } catch {
             errorMessage = error.localizedDescription
+            analyticsService.trackError(errorType: "sign_out_failed", context: "AuthService.signOut", message: error.localizedDescription)
         }
     }
 
@@ -94,11 +105,14 @@ class AuthService: NSObject, ObservableObject {
               let appleIDToken = appleIDCredential.identityToken,
               let idTokenString = String(data: appleIDToken, encoding: .utf8) else {
             errorMessage = "Unable to fetch identity token"
+            analyticsService.trackSignInFailure(method: "apple", errorCode: "invalid_token")
             return
         }
 
         isLoading = true
         errorMessage = nil
+
+        analyticsService.trackSignInAttempted(method: "apple")
 
         let credential = OAuthProvider.appleCredential(
             withIDToken: idTokenString,
@@ -128,13 +142,16 @@ class AuthService: NSObject, ObservableObject {
             }
 
             // Create user document
-            await FirestoreService.shared.createUserIfNeeded(
+            let isNewUser = await FirestoreService.shared.createUserIfNeeded(
                 userId: result.user.uid,
                 displayName: displayName,
                 email: result.user.email ?? appleIDCredential.email
             )
+
+            analyticsService.trackSignInSuccess(method: "apple", isNewUser: isNewUser)
         } catch {
             self.errorMessage = error.localizedDescription
+            analyticsService.trackSignInFailure(method: "apple", errorCode: String(describing: error))
         }
 
         isLoading = false
