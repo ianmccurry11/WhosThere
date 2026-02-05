@@ -20,8 +20,8 @@ class AuthService: NSObject, ObservableObject {
 
     private var authStateHandler: AuthStateDidChangeListenerHandle?
     private var currentNonce: String?
-    private var analyticsService: AnalyticsService { AnalyticsService.shared }
-    private var networkInspector: NetworkInspector { NetworkInspector.shared }
+    var analyticsService: AnalyticsService { AnalyticsService.shared }
+    var networkInspector: NetworkInspector { NetworkInspector.shared }
 
     override init() {
         super.init()
