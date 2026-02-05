@@ -29,6 +29,7 @@ struct AnalyticsDashboardView: View {
                     Text("Events").tag(0)
                     Text("Counts").tag(1)
                     Text("Validation").tag(2)
+                    Text("Network").tag(3)
                 }
                 .pickerStyle(.segmented)
                 .padding()
@@ -41,6 +42,8 @@ struct AnalyticsDashboardView: View {
                     countsView
                 case 2:
                     validationView
+                case 3:
+                    NetworkInspectorView()
                 default:
                     EmptyView()
                 }

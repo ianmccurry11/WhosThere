@@ -27,6 +27,7 @@ class FirestoreService: ObservableObject {
     private var presenceListeners: [String: ListenerRegistration] = [:]
     private var achievementService: AchievementService { AchievementService.shared }
     private var analyticsService: AnalyticsService { AnalyticsService.shared }
+    private var networkInspector: NetworkInspector { NetworkInspector.shared }
 
     // MARK: - Error Handling
 
@@ -158,8 +159,12 @@ class FirestoreService: ObservableObject {
 
         print("fetchCurrentUser: Fetching user \(userId)")
 
+        let startTime = Date()
         do {
             let document = try await db.collection("users").document(userId).getDocument()
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logDocumentRead(collection: "users", documentId: userId, durationMs: duration, success: true)
+
             if document.exists {
                 self.currentUser = try document.data(as: User.self)
                 print("fetchCurrentUser: Fetched user with \(self.currentUser?.joinedGroupIds.count ?? 0) groups")
@@ -173,6 +178,8 @@ class FirestoreService: ObservableObject {
                 )
             }
         } catch {
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logDocumentRead(collection: "users", documentId: userId, durationMs: duration, success: false, error: error)
             print("Error fetching user: \(error)")
         }
     }
@@ -306,6 +313,7 @@ class FirestoreService: ObservableObject {
         var validatedGroup = group
         validatedGroup.name = Validation.sanitizeGroupName(group.name)
 
+        let startTime = Date()
         do {
             let newDocRef = db.collection("groups").document()
             let groupId = newDocRef.documentID
@@ -315,6 +323,8 @@ class FirestoreService: ObservableObject {
 
             print("[FirestoreService] Creating group with ID: \(groupId)")
             try await newDocRef.setData(groupData)
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logDocumentWrite(collection: "groups", documentId: groupId, durationMs: duration, success: true)
             print("[FirestoreService] Group document created successfully")
 
             // Update user's joinedGroupIds - do this in a separate try/catch so group creation still succeeds
@@ -353,6 +363,8 @@ class FirestoreService: ObservableObject {
             print("[FirestoreService] Group creation complete, returning success")
             return .success(groupId)
         } catch {
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logDocumentWrite(collection: "groups", documentId: nil, durationMs: duration, success: false, error: error)
             print("[FirestoreService] Group creation failed with error: \(error)")
             let appError = AppError.groupCreationFailed(underlying: error)
             handleError(appError)
@@ -372,10 +384,14 @@ class FirestoreService: ObservableObject {
 
         // Query groups where the user is in memberIds
         // This is more reliable than tracking joinedGroupIds on the user document
+        let startTime = Date()
         do {
             let snapshot = try await db.collection("groups")
                 .whereField("memberIds", arrayContains: userId)
                 .getDocuments()
+
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logQuery(collection: "groups", durationMs: duration, resultCount: snapshot.documents.count, success: true)
 
             print("Fetched \(snapshot.documents.count) group documents where user is member")
 
@@ -397,17 +413,23 @@ class FirestoreService: ObservableObject {
                 self.currentUser?.joinedGroupIds = self.joinedGroups.compactMap { $0.id }
             }
         } catch {
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logQuery(collection: "groups", durationMs: duration, resultCount: 0, success: false, error: error)
             print("Error fetching joined groups: \(error)")
         }
     }
 
     func fetchPublicGroups() async {
         print("fetchPublicGroups() called")
+        let startTime = Date()
         do {
             let snapshot = try await db.collection("groups")
                 .whereField("isPublic", isEqualTo: true)
                 .limit(to: 50)
                 .getDocuments()
+
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logQuery(collection: "groups", durationMs: duration, resultCount: snapshot.documents.count, success: true)
 
             print("Fetched \(snapshot.documents.count) public group documents")
 
@@ -417,6 +439,8 @@ class FirestoreService: ObservableObject {
 
             print("publicGroups now has \(publicGroups.count) groups")
         } catch {
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logQuery(collection: "groups", durationMs: duration, resultCount: 0, success: false, error: error)
             print("Error fetching public groups: \(error)")
         }
     }
@@ -705,16 +729,22 @@ class FirestoreService: ObservableObject {
     }
 
     func fetchPresenceForGroup(groupId: String) async -> [Presence] {
+        let startTime = Date()
         do {
             let snapshot = try await db.collection("presence").document(groupId)
                 .collection("members")
                 .whereField("isPresent", isEqualTo: true)
                 .getDocuments()
 
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logQuery(collection: "presence/\(groupId)/members", durationMs: duration, resultCount: snapshot.documents.count, success: true)
+
             return snapshot.documents.compactMap { doc in
                 try? doc.data(as: Presence.self)
             }
         } catch {
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logQuery(collection: "presence/\(groupId)/members", durationMs: duration, resultCount: 0, success: false, error: error)
             print("Error fetching presence: \(error)")
             return []
         }

@@ -21,6 +21,7 @@ class AuthService: NSObject, ObservableObject {
     private var authStateHandler: AuthStateDidChangeListenerHandle?
     private var currentNonce: String?
     private var analyticsService: AnalyticsService { AnalyticsService.shared }
+    private var networkInspector: NetworkInspector { NetworkInspector.shared }
 
     override init() {
         super.init()
@@ -49,8 +50,12 @@ class AuthService: NSObject, ObservableObject {
 
         analyticsService.trackSignInAttempted(method: "anonymous")
 
+        let startTime = Date()
         do {
             let result = try await Auth.auth().signInAnonymously()
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logAuthOperation(method: "signIn", durationMs: duration, success: true)
+
             self.user = result.user
             self.isAuthenticated = true
 
@@ -68,6 +73,8 @@ class AuthService: NSObject, ObservableObject {
 
             analyticsService.trackSignInSuccess(method: "anonymous", isNewUser: isNewUser)
         } catch {
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logAuthOperation(method: "signIn", durationMs: duration, success: false, error: error)
             self.errorMessage = error.localizedDescription
             analyticsService.trackSignInFailure(method: "anonymous", errorCode: String(describing: error))
         }
@@ -76,12 +83,17 @@ class AuthService: NSObject, ObservableObject {
     }
 
     func signOut() {
+        let startTime = Date()
         do {
             try Auth.auth().signOut()
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logAuthOperation(method: "signOut", durationMs: duration, success: true)
             user = nil
             isAuthenticated = false
             analyticsService.trackSignOut()
         } catch {
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logAuthOperation(method: "signOut", durationMs: duration, success: false, error: error)
             errorMessage = error.localizedDescription
             analyticsService.trackError(errorType: "sign_out_failed", context: "AuthService.signOut", message: error.localizedDescription)
         }
@@ -120,8 +132,11 @@ class AuthService: NSObject, ObservableObject {
             fullName: appleIDCredential.fullName
         )
 
+        let startTime = Date()
         do {
             let result = try await Auth.auth().signIn(with: credential)
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logAuthOperation(method: "signIn", durationMs: duration, success: true)
             self.user = result.user
             self.isAuthenticated = true
 
@@ -150,6 +165,8 @@ class AuthService: NSObject, ObservableObject {
 
             analyticsService.trackSignInSuccess(method: "apple", isNewUser: isNewUser)
         } catch {
+            let duration = Date().timeIntervalSince(startTime) * 1000
+            networkInspector.logAuthOperation(method: "signIn", durationMs: duration, success: false, error: error)
             self.errorMessage = error.localizedDescription
             analyticsService.trackSignInFailure(method: "apple", errorCode: String(describing: error))
         }
