@@ -15,6 +15,7 @@ struct AnalyticsDashboardView: View {
 
     @State private var selectedTab = 0
     @State private var showExportSheet = false
+    @State private var showFailureInjection = false
     @State private var exportedJSON = ""
     @State private var filterText = ""
 
@@ -63,6 +64,14 @@ struct AnalyticsDashboardView: View {
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
                         Button {
+                            showFailureInjection = true
+                        } label: {
+                            Label("Failure Injection", systemImage: "ant")
+                        }
+
+                        Divider()
+
+                        Button {
                             exportEvents()
                         } label: {
                             Label("Export Events", systemImage: "square.and.arrow.up")
@@ -83,6 +92,9 @@ struct AnalyticsDashboardView: View {
                         Image(systemName: "ellipsis.circle")
                     }
                 }
+            }
+            .sheet(isPresented: $showFailureInjection) {
+                FailureInjectionView()
             }
             .sheet(isPresented: $showExportSheet) {
                 exportSheet
