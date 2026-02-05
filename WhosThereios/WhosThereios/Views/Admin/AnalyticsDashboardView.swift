@@ -28,8 +28,8 @@ struct AnalyticsDashboardView: View {
                 Picker("View", selection: $selectedTab) {
                     Text("Events").tag(0)
                     Text("Counts").tag(1)
-                    Text("Validation").tag(2)
-                    Text("Network").tag(3)
+                    Text("Network").tag(2)
+                    Text("Devices").tag(3)
                 }
                 .pickerStyle(.segmented)
                 .padding()
@@ -41,9 +41,9 @@ struct AnalyticsDashboardView: View {
                 case 1:
                     countsView
                 case 2:
-                    validationView
-                case 3:
                     NetworkInspectorView()
+                case 3:
+                    TestMatrixView()
                 default:
                     EmptyView()
                 }
