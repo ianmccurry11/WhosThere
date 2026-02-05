@@ -30,6 +30,7 @@ struct AnalyticsDashboardView: View {
                     Text("Counts").tag(1)
                     Text("Network").tag(2)
                     Text("Devices").tag(3)
+                    Text("Checks").tag(4)
                 }
                 .pickerStyle(.segmented)
                 .padding()
@@ -44,6 +45,8 @@ struct AnalyticsDashboardView: View {
                     NetworkInspectorView()
                 case 3:
                     TestMatrixView()
+                case 4:
+                    RegressionChecklistView()
                 default:
                     EmptyView()
                 }
