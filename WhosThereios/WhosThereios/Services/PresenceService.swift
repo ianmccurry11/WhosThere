@@ -8,6 +8,7 @@
 import Foundation
 import Combine
 import CoreLocation
+import FirebaseFirestore
 
 /// Manages user presence (check-in/out) across all joined groups.
 /// Handles manual check-ins, geofence-triggered transitions, auto-checkout timers,
@@ -33,13 +34,25 @@ class PresenceService: ObservableObject {
     private var checkInTimes: [String: Date] = [:]
 
     private var cancellables = Set<AnyCancellable>()
-    private var presenceListeners: [String: Any] = [:]
+    private var presenceListeners: [String: ListenerRegistration] = [:]
+
+    /// Raw presence docs per group exactly as Firestore last sent them (unfiltered).
+    /// `presenceByGroup` is always derived from this with `Presence.isActive`.
+    private var rawPresenceByGroup: [String: [Presence]] = [:]
+    /// Joined groups handed to `startMonitoring` (geofenced)
+    private var monitoredGroupIds: Set<String> = []
+    /// Every group the map or list can show (joined + nearby public)
+    private var displayedGroupIds: Set<String> = []
+    /// A group open in the detail sheet that may not be in either set above
+    private var focusedGroupId: String?
+    /// Groups where we're already writing a checkout for our own lapsed presence
+    private var pendingStaleCheckouts: Set<String> = []
+    /// Re-applies the freshness rule so lapsed check-ins drop off without a new snapshot
+    private var expiryTickTask: Task<Void, Never>?
+    private let expiryTickInterval: TimeInterval = 30
     private var lastAutoUpdate: [String: Date] = [:]
     private let updateThrottle: TimeInterval = 30 // Minimum seconds between auto-updates
     private var checkOutTimerTasks: [String: Task<Void, Never>] = [:]
-
-    /// Maximum time a user can be marked as present before auto check-out (5 hours)
-    private let maxPresenceDuration: TimeInterval = 5 * 60 * 60
 
     /// UserDefaults key for persisted auto-checkout expiration times
     private let persistedTimersKey = "autoCheckOutExpirations"
@@ -52,6 +65,7 @@ class PresenceService: ObservableObject {
     init() {
         setupLocationCallbacks()
         restorePersistedTimers()
+        observeDisplayedGroups()
     }
 
     /// Returns true if location permission is "Always", false otherwise
@@ -83,11 +97,8 @@ class PresenceService: ObservableObject {
     func startMonitoring(groups: [LocationGroup]) {
         locationService.startMonitoringGroups(groups)
 
-        // Set up presence listeners for each group
-        for group in groups {
-            guard let groupId = group.id else { continue }
-            startListeningToPresence(groupId: groupId)
-        }
+        monitoredGroupIds = Set(groups.compactMap(\.id))
+        syncPresenceListeners()
 
         // Do initial presence check
         Task {
@@ -98,8 +109,10 @@ class PresenceService: ObservableObject {
     func stopMonitoring() {
         locationService.stopMonitoringAllGroups()
 
-        // Remove all presence listeners
-        presenceListeners.removeAll()
+        // Drop listeners that only existed for geofenced groups; groups still
+        // shown on the map/list keep theirs
+        monitoredGroupIds.removeAll()
+        syncPresenceListeners()
     }
 
     // MARK: - Manual Check-in/out
@@ -472,113 +485,144 @@ class PresenceService: ObservableObject {
 
     // MARK: - Stale Presence Cleanup
 
-    /// Checks if a presence record is stale (older than maxPresenceDuration) or expired (past expiresAt)
-    private func isPresenceStale(_ presence: Presence) -> Bool {
-        // Check expiresAt first — this is the primary expiration mechanism
-        if presence.isExpired {
-            return true
+    /// If the current user's own check-in has lapsed, write the checkout so other
+    /// members' phones (and arrival/departure notifications) see it too.
+    /// Security rules only allow writing your own presence, so other people's
+    /// lapsed check-ins are just hidden by `Presence.isActive`.
+    private func checkOutOwnStalePresence(in groupId: String) {
+        guard let userId = firestoreService.currentUser?.id,
+              !pendingStaleCheckouts.contains(groupId),
+              let own = rawPresenceByGroup[groupId]?.first(where: { $0.userId == userId }),
+              own.isPresent,
+              !own.isActive() else { return }
+
+        pendingStaleCheckouts.insert(groupId)
+        AppLogger.debug("Auto check-out: own presence lapsed in group \(groupId)")
+        Task {
+            await performAutoCheckOut(groupId: groupId, reason: "stale")
+            pendingStaleCheckouts.remove(groupId)
         }
-        // Fallback: 5-hour hard cap for presences without expiresAt (legacy records)
-        let age = Date().timeIntervalSince(presence.lastUpdated)
-        return age > maxPresenceDuration
-    }
-
-    /// Filters out stale/expired presences from a list.
-    /// For the current user's own stale presences, writes checkout to Firestore.
-    /// For other users, only filters them from the UI (security rules prevent cross-user writes).
-    private func filterStalePresences(_ presences: [Presence]) -> [Presence] {
-        let currentUserId = firestoreService.currentUser?.id
-
-        var active: [Presence] = []
-        var ownStaleGroupIds: [String] = []
-
-        for presence in presences {
-            if isPresenceStale(presence) {
-                if presence.userId == currentUserId {
-                    ownStaleGroupIds.append(presence.groupId)
-                }
-                // Stale presences from any user are filtered from the UI
-            } else {
-                active.append(presence)
-            }
-        }
-
-        // Write checkout to Firestore for the current user's own stale presences
-        if !ownStaleGroupIds.isEmpty {
-            Task {
-                for groupId in ownStaleGroupIds {
-                    AppLogger.debug("Cleaning up own stale presence in group \(groupId)")
-                    await performAutoCheckOut(groupId: groupId, reason: "stale_filter")
-                }
-            }
-        }
-
-        return active
     }
 
     /// Checks if the current user has any stale presences and auto checks them out
     func checkAndClearStalePresences() async {
-        guard let userId = firestoreService.currentUser?.id else { return }
+        for groupId in rawPresenceByGroup.keys {
+            publishSummary(for: groupId)
+            checkOutOwnStalePresence(in: groupId)
+        }
+    }
 
-        for (groupId, summary) in presenceByGroup {
-            // Find current user's presence in this group
-            if let userPresence = summary.presentMembers.first(where: { $0.userId == userId }) {
-                if isPresenceStale(userPresence) {
-                    AppLogger.debug("Stale presence detected for user in group: \(groupId)")
-                    await performAutoCheckOut(groupId: groupId, reason: "stale")
+    // MARK: - Presence Data (single source of truth)
+
+    /// Keeps a live listener on every group any screen can show — joined groups
+    /// plus nearby public groups — so map bubbles, lists and the detail sheet
+    /// all read the same `presenceByGroup`.
+    private func observeDisplayedGroups() {
+        firestoreService.$joinedGroups
+            .combineLatest(firestoreService.$publicGroups)
+            .map { joined, publicGroups in Set((joined + publicGroups).compactMap(\.id)) }
+            .removeDuplicates()
+            .sink { [weak self] groupIds in
+                Task { @MainActor in
+                    self?.displayedGroupIds = groupIds
+                    self?.syncPresenceListeners()
                 }
             }
-        }
+            .store(in: &cancellables)
     }
 
-    // MARK: - Presence Data
+    /// Makes sure presence is live for a group opened from somewhere other than
+    /// the map or list (e.g. a notification). Pass nil when the sheet closes.
+    func focusPresence(on groupId: String?) {
+        focusedGroupId = groupId
+        syncPresenceListeners()
+    }
+
+    /// Adds listeners for newly shown groups and removes ones no longer shown.
+    private func syncPresenceListeners() {
+        var wanted = monitoredGroupIds.union(displayedGroupIds)
+        if let focusedGroupId {
+            wanted.insert(focusedGroupId)
+        }
+
+        for (groupId, listener) in presenceListeners where !wanted.contains(groupId) {
+            listener.remove()
+            presenceListeners.removeValue(forKey: groupId)
+            rawPresenceByGroup.removeValue(forKey: groupId)
+            presenceByGroup.removeValue(forKey: groupId)
+        }
+
+        for groupId in wanted where presenceListeners[groupId] == nil {
+            startListeningToPresence(groupId: groupId)
+        }
+
+        if wanted.isEmpty {
+            stopExpiryTick()
+        } else {
+            startExpiryTick()
+        }
+    }
 
     private func startListeningToPresence(groupId: String) {
-        let listener = firestoreService.listenToPresence(groupId: groupId) { [weak self] presences in
+        presenceListeners[groupId] = firestoreService.listenToPresence(groupId: groupId) { [weak self] presences in
             Task { @MainActor in
-                guard let self = self else { return }
-                // Filter out stale presences (older than 5 hours)
-                let activePresences = self.filterStalePresences(presences)
-
-                self.presenceByGroup[groupId] = GroupPresenceSummary(
-                    groupId: groupId,
-                    presentCount: activePresences.count,
-                    presentMembers: activePresences
-                )
-
-                // Check if current user's presence is stale and auto check-out
-                await self.checkCurrentUserStalePresence(groupId: groupId, presences: presences)
+                // Ignore callbacks that land after the listener was removed
+                guard let self, self.presenceListeners[groupId] != nil else { return }
+                self.applyPresence(presences, for: groupId)
             }
         }
-        presenceListeners[groupId] = listener
     }
 
-    /// Checks if the current user's presence in a specific group is stale and auto checks out
-    private func checkCurrentUserStalePresence(groupId: String, presences: [Presence]) async {
-        guard let userId = firestoreService.currentUser?.id else { return }
+    /// Stores a fresh set of presence docs and republishes the filtered summary.
+    private func applyPresence(_ presences: [Presence], for groupId: String) {
+        rawPresenceByGroup[groupId] = presences
+        publishSummary(for: groupId)
+        checkOutOwnStalePresence(in: groupId)
+    }
 
-        if let userPresence = presences.first(where: { $0.userId == userId && $0.isPresent }) {
-            if isPresenceStale(userPresence) {
-                AppLogger.debug("Auto check-out: User presence stale in group \(groupId) (> 5 hours)")
-                await performAutoCheckOut(groupId: groupId, reason: "stale")
+    private func publishSummary(for groupId: String, now: Date = Date()) {
+        let active = (rawPresenceByGroup[groupId] ?? []).filter { $0.isActive(at: now) }
+        presenceByGroup[groupId] = GroupPresenceSummary(
+            groupId: groupId,
+            presentCount: active.count,
+            presentMembers: active
+        )
+    }
+
+    // MARK: - Expiry Tick
+
+    private func startExpiryTick() {
+        guard expiryTickTask == nil else { return }
+        expiryTickTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64((self?.expiryTickInterval ?? 30) * 1_000_000_000))
+                guard !Task.isCancelled else { return }
+                self?.dropLapsedPresences()
             }
+        }
+    }
+
+    private func stopExpiryTick() {
+        expiryTickTask?.cancel()
+        expiryTickTask = nil
+    }
+
+    /// Removes people whose check-in lapsed since the last snapshot, so the UI
+    /// updates on its own instead of waiting for Firestore to send something.
+    private func dropLapsedPresences() {
+        let now = Date()
+        for (groupId, summary) in presenceByGroup
+        where summary.presentMembers.contains(where: { !$0.isActive(at: now) }) {
+            publishSummary(for: groupId, now: now)
+            checkOutOwnStalePresence(in: groupId)
         }
     }
 
     func refreshPresence(groupId: String) async {
-        let presences = await firestoreService.fetchPresenceForGroup(groupId: groupId)
-
-        // Filter out stale presences
-        let activePresences = filterStalePresences(presences)
-
-        presenceByGroup[groupId] = GroupPresenceSummary(
-            groupId: groupId,
-            presentCount: activePresences.count,
-            presentMembers: activePresences
-        )
-
-        // Check if current user's presence is stale
-        await checkCurrentUserStalePresence(groupId: groupId, presences: presences)
+        // On a failed fetch keep what we have rather than showing "No one here"
+        if let presences = await firestoreService.fetchPresenceForGroup(groupId: groupId) {
+            applyPresence(presences, for: groupId)
+        }
 
         // Sync updated presence data to widget
         WidgetDataService.shared.syncToWidget()

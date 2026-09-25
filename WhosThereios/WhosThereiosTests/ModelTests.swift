@@ -276,3 +276,49 @@ final class UserTests: XCTestCase {
         XCTAssertTrue(user.joinedGroupIds.isEmpty)
     }
 }
+
+final class PresenceActiveRuleTests: XCTestCase {
+
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func presence(
+        isPresent: Bool = true,
+        updatedAgo: TimeInterval,
+        expiresIn: TimeInterval? = nil
+    ) -> Presence {
+        Presence(
+            userId: "user1",
+            groupId: "group1",
+            isPresent: isPresent,
+            lastUpdated: now.addingTimeInterval(-updatedAgo),
+            expiresAt: expiresIn.map { now.addingTimeInterval($0) }
+        )
+    }
+
+    func testFreshPresenceIsActive() {
+        XCTAssertTrue(presence(updatedAgo: 60, expiresIn: 3600).isActive(at: now))
+    }
+
+    func testCheckedOutPresenceIsNotActive() {
+        XCTAssertFalse(presence(isPresent: false, updatedAgo: 60, expiresIn: 3600).isActive(at: now))
+    }
+
+    func testExpiredPresenceIsNotActive() {
+        XCTAssertFalse(presence(updatedAgo: 60, expiresIn: -1).isActive(at: now))
+    }
+
+    func testPresenceExpiringExactlyNowIsNotActive() {
+        XCTAssertFalse(presence(updatedAgo: 60, expiresIn: 0).isActive(at: now))
+    }
+
+    /// A check-in last written 3 days ago must not show, even with a far-off expiry
+    func testThreeDayOldPresenceIsNotActive() {
+        let old = presence(updatedAgo: 3 * 24 * 3600, expiresIn: 3600)
+        XCTAssertFalse(old.isActive(at: now))
+    }
+
+    func testLegacyPresenceWithoutExpiryUsesMaxAge() {
+        XCTAssertTrue(presence(updatedAgo: Presence.maxAge - 1).isActive(at: now))
+        XCTAssertFalse(presence(updatedAgo: Presence.maxAge + 1).isActive(at: now))
+    }
+}

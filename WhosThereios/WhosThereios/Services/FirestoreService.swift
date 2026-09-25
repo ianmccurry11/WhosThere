@@ -925,7 +925,9 @@ class FirestoreService: ObservableObject {
         }
     }
 
-    func fetchPresenceForGroup(groupId: String) async -> [Presence] {
+    /// Returns nil when the fetch fails, so callers don't mistake a network
+    /// error for "no one is here" and wipe the display.
+    func fetchPresenceForGroup(groupId: String) async -> [Presence]? {
         let startTime = Date()
         do {
             let snapshot = try await db.collection("presence").document(groupId)
@@ -943,7 +945,7 @@ class FirestoreService: ObservableObject {
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logQuery(collection: "presence/\(groupId)/members", durationMs: duration, resultCount: 0, success: false, error: error)
             AppLogger.debug("Error fetching presence: \(error)")
-            return []
+            return nil
         }
     }
 
@@ -952,7 +954,10 @@ class FirestoreService: ObservableObject {
             .collection("members")
             .whereField("isPresent", isEqualTo: true)
             .addSnapshotListener { snapshot, error in
-                guard let documents = snapshot?.documents else { return }
+                guard let documents = snapshot?.documents else {
+                    AppLogger.debug("Presence listener error for group \(groupId): \(String(describing: error))")
+                    return
+                }
                 let presences = documents.compactMap { doc in
                     try? doc.data(as: Presence.self)
                 }

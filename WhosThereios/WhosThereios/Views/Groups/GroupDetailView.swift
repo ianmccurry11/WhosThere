@@ -19,10 +19,8 @@ struct GroupDetailView: View {
 
     let group: LocationGroup
 
-    @State private var presences: [Presence] = []
     @State private var isJoined = false
     @State private var isOwner = false
-    @State private var isPresent = false
     @State private var showSettings = false
     @State private var showLeaveConfirmation = false
     @State private var showDeleteConfirmation = false
@@ -33,6 +31,17 @@ struct GroupDetailView: View {
     @State private var profilePresence: Presence?
     @State private var friendRequestAlertMessage: String?
     @State private var showFriendRequestAlert = false
+
+    /// Everyone here right now — the same live data the map bubble uses
+    private var presences: [Presence] {
+        guard let groupId = group.id else { return [] }
+        return presenceService.presenceByGroup[groupId]?.presentMembers ?? []
+    }
+
+    private var isPresent: Bool {
+        guard let userId = Auth.auth().currentUser?.uid else { return false }
+        return presences.contains { $0.userId == userId }
+    }
 
     /// Check if the group has valid coordinates for display
     private var hasValidCoordinates: Bool {
@@ -422,9 +431,11 @@ struct GroupDetailView: View {
             AppLogger.debug("  - Has valid coords: \(hasValidCoordinates)")
 
             setupState()
-            Task {
-                await loadPresence()
-            }
+            // Guarantees a live listener even if this group isn't on the map/list
+            presenceService.focusPresence(on: group.id)
+        }
+        .onDisappear {
+            presenceService.focusPresence(on: nil)
         }
         .task {
             // Refresh map after a short delay to ensure it renders
@@ -496,22 +507,12 @@ struct GroupDetailView: View {
             // Check if user has joined this group, OR if they're the owner (owner is always joined)
             let inJoinedList = firestoreService.currentUser?.joinedGroupIds.contains(groupId) ?? false
             isJoined = inJoinedList || isOwner || group.memberIds.contains(userId)
-            isPresent = presenceService.isUserPresent(groupId: groupId, userId: userId)
         } else {
             // If group.id is nil, assume joined if we're the owner
             isJoined = isOwner
         }
 
         AppLogger.debug("isJoined: \(isJoined), isOwner: \(isOwner), isPresent: \(isPresent)")
-    }
-
-    private func loadPresence() async {
-        guard let groupId = group.id else { return }
-        presences = await firestoreService.fetchPresenceForGroup(groupId: groupId)
-
-        if let userId = Auth.auth().currentUser?.uid {
-            isPresent = presences.contains { $0.userId == userId }
-        }
     }
 
     private func togglePresence() async {
@@ -522,9 +523,6 @@ struct GroupDetailView: View {
         } else {
             await presenceService.manualCheckIn(groupId: groupId)
         }
-
-        isPresent.toggle()
-        await loadPresence()
     }
 
     private func joinGroup() async {

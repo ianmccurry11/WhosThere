@@ -52,6 +52,19 @@ struct Presence: Identifiable, Codable {
         guard let expiresAt else { return false }
         return Date() >= expiresAt
     }
+
+    /// Hard cap on how long a check-in counts without being refreshed (5 hours).
+    /// Also covers legacy records written before `expiresAt` existed.
+    static let maxAge: TimeInterval = 5 * 60 * 60
+
+    /// The single rule every screen uses to decide whether someone is "here".
+    /// Map bubbles, lists, the group detail sheet, widgets and the watch all go
+    /// through this, so they can never disagree.
+    func isActive(at now: Date = Date()) -> Bool {
+        guard isPresent else { return false }
+        if let expiresAt, now >= expiresAt { return false }
+        return now.timeIntervalSince(lastUpdated) <= Self.maxAge
+    }
 }
 
 struct GroupPresenceSummary {
