@@ -66,12 +66,12 @@ class FriendService: ObservableObject {
             }
 
             self.friends = loadedFriends
-            print("Loaded \(friends.count) friends")
+            AppLogger.debug("Loaded \(friends.count) friends")
 
             // Fetch presence for all friends
             await fetchFriendsPresence()
         } catch {
-            print("Error loading friends: \(error)")
+            AppLogger.debug("Error loading friends: \(error)")
         }
     }
 
@@ -109,7 +109,8 @@ class FriendService: ObservableObject {
 
         do {
             try db.collection("friendRequests").addDocument(from: request)
-            print("Friend request sent to \(toUserId)")
+            AppLogger.debug("Friend request sent to \(toUserId)")
+            await AchievementService.shared.recordFriendRequestSent()
         } catch {
             throw FriendError.requestFailed(error)
         }
@@ -141,10 +142,13 @@ class FriendService: ObservableObject {
 
         do {
             try await batch.commit()
-            print("Friend request accepted from \(request.senderId)")
+            AppLogger.debug("Friend request accepted from \(request.senderId)")
 
             // Reload friends
             await loadFriends()
+
+            // Track achievement
+            await AchievementService.shared.recordFriendRequestAccepted()
         } catch {
             throw FriendError.requestFailed(error)
         }
@@ -159,7 +163,7 @@ class FriendService: ObservableObject {
             try await db.collection("friendRequests").document(requestId).updateData([
                 "status": FriendRequest.RequestStatus.declined.rawValue
             ])
-            print("Friend request declined from \(request.senderId)")
+            AppLogger.debug("Friend request declined from \(request.senderId)")
         } catch {
             throw FriendError.requestFailed(error)
         }
@@ -172,7 +176,7 @@ class FriendService: ObservableObject {
 
         do {
             try await db.collection("friendRequests").document(requestId).delete()
-            print("Friend request cancelled to \(request.receiverId)")
+            AppLogger.debug("Friend request cancelled to \(request.receiverId)")
         } catch {
             throw FriendError.requestFailed(error)
         }
@@ -199,7 +203,7 @@ class FriendService: ObservableObject {
             try await batch.commit()
             friends.removeAll { $0.id == friendId }
             friendPresences.removeValue(forKey: friendId)
-            print("Removed friend \(friendId)")
+            AppLogger.debug("Removed friend \(friendId)")
         } catch {
             throw FriendError.removeFailed(error)
         }
@@ -221,7 +225,7 @@ class FriendService: ObservableObject {
                     try? doc.data(as: FriendRequest.self)
                 }
 
-                print("Updated pending requests: \(self?.pendingRequests.count ?? 0)")
+                AppLogger.debug("Updated pending requests: \(self?.pendingRequests.count ?? 0)")
             }
 
         // Also listen for sent requests
@@ -304,6 +308,61 @@ class FriendService: ObservableObject {
         } catch {
             throw FriendError.updateFailed(error)
         }
+    }
+
+    // MARK: - People You May Know
+
+    /// Finds users who share groups with the current user but aren't friends.
+    /// Returns users sorted by number of shared groups (most shared first).
+    func fetchPeopleYouMayKnow() async -> [User] {
+        guard let currentUserId = Auth.auth().currentUser?.uid else { return [] }
+
+        let joinedGroups = firestoreService.joinedGroups
+        let friendIds = Set(friends.compactMap(\.id))
+        let pendingIds = Set(sentRequests.map(\.receiverId) + pendingRequests.map(\.senderId))
+
+        // Collect all member IDs from joined groups
+        var memberGroupCounts: [String: Int] = [:]
+        for group in joinedGroups {
+            for memberId in group.memberIds where memberId != currentUserId {
+                if !friendIds.contains(memberId) && !pendingIds.contains(memberId) {
+                    memberGroupCounts[memberId, default: 0] += 1
+                }
+            }
+        }
+
+        // Sort by shared group count, limit to 20
+        let topCandidates = memberGroupCounts
+            .sorted { $0.value > $1.value }
+            .prefix(20)
+            .map(\.key)
+
+        guard !topCandidates.isEmpty else { return [] }
+
+        // Fetch user profiles
+        let users = await firestoreService.fetchUsersByIds(Array(topCandidates))
+
+        // Re-sort by shared group count
+        return users.sorted { u1, u2 in
+            let c1 = memberGroupCounts[u1.id ?? ""] ?? 0
+            let c2 = memberGroupCounts[u2.id ?? ""] ?? 0
+            return c1 > c2
+        }
+    }
+
+    /// Returns the number of groups the current user shares with a given user.
+    func sharedGroupCount(with userId: String) -> Int {
+        firestoreService.joinedGroups.filter { $0.memberIds.contains(userId) }.count
+    }
+
+    /// Checks if a user is currently present at any of the current user's groups.
+    func isUserNearby(_ userId: String) -> Bool {
+        for (_, summary) in presenceService.presenceByGroup {
+            if summary.presentMembers.contains(where: { $0.userId == userId }) {
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: - Helpers

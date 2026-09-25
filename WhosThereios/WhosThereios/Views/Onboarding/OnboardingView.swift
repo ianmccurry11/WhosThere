@@ -17,31 +17,31 @@ struct OnboardingView: View {
             image: "mappin.and.ellipse",
             title: "Find Your Crew",
             description: "Create or join groups for your favorite spots - basketball courts, parks, coffee shops, or anywhere your friends gather.",
-            color: .appOliveGreen
+            color: .appBlue
         ),
         OnboardingPage(
             image: "eye.slash.fill",
             title: "Privacy First",
             description: "We only share whether you're at a location, never your exact position. Your location data stays on your device.",
-            color: .appDarkGreen
+            color: .appNavy
         ),
         OnboardingPage(
             image: "bell.badge.fill",
             title: "Know Who's There",
             description: "See when friends arrive at your favorite spots. No more empty courts or missed hangouts.",
-            color: .appTan
+            color: .appAmber
         ),
         OnboardingPage(
             image: "location.fill",
             title: "Enable Location",
             description: "Allow location access to see nearby groups and check in when you arrive.",
-            color: .appBrown
+            color: .appCoral
         ),
         OnboardingPage(
             image: "location.circle.fill",
             title: "Always Allow (Recommended)",
             description: "For automatic check-ins even when the app is closed, enable 'Always' location access. This enables background geofencing for a seamless experience.",
-            color: .appOliveGreen
+            color: .appBlue
         )
     ]
 
@@ -69,6 +69,8 @@ struct OnboardingView: View {
                             .animation(.spring(response: 0.3), value: currentPage)
                     }
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Page \(currentPage + 1) of \(pages.count)")
 
                 // Action button
                 Button(action: {
@@ -104,18 +106,9 @@ struct OnboardingView: View {
                 }
                 .padding(.horizontal, 24)
 
-                // Skip button (not on last page)
-                if currentPage < pages.count - 1 {
-                    Button("Skip") {
-                        completeOnboarding()
-                    }
+                // Spacer to maintain layout
+                Text(" ")
                     .font(.subheadline)
-                    .foregroundColor(.secondary)
-                } else {
-                    // Placeholder to maintain layout
-                    Text(" ")
-                        .font(.subheadline)
-                }
             }
             .padding(.bottom, 40)
         }
@@ -130,16 +123,7 @@ struct OnboardingView: View {
     }
 
     private func getButtonText() -> String {
-        switch currentPage {
-        case pages.count - 2:
-            return "Enable Location"
-        case pages.count - 1:
-            return "Enable Always (Recommended)"
-        case pages.count - 1 where currentPage == pages.count - 1:
-            return "Get Started"
-        default:
-            return "Continue"
-        }
+        return "Continue"
     }
 }
 
@@ -177,6 +161,7 @@ struct OnboardingPageView: View {
                     .opacity(isAnimated ? 1.0 : 0.0)
             }
             .animation(.spring(response: 0.6, dampingFraction: 0.7).delay(0.1), value: isAnimated)
+            .accessibilityHidden(true)
 
             // Text content
             VStack(spacing: 16) {
@@ -192,14 +177,15 @@ struct OnboardingPageView: View {
                     .font(.body)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 32)
                     .opacity(isAnimated ? 1.0 : 0.0)
                     .offset(y: isAnimated ? 0 : 20)
                     .animation(.easeOut(duration: 0.5).delay(0.4), value: isAnimated)
             }
 
-            Spacer()
-            Spacer()
+            Spacer(minLength: 0)
+            Spacer(minLength: 0)
         }
         .onAppear {
             isAnimated = true

@@ -86,6 +86,11 @@ enum Validation {
             return .invalid(.invalidDisplayName(reason: "Name contains invalid characters"))
         }
 
+        // Check for inappropriate language
+        if containsProfanity(trimmed) != nil {
+            return .invalid(.invalidDisplayName(reason: "Name contains inappropriate language"))
+        }
+
         return .valid
     }
 
@@ -107,6 +112,11 @@ enum Validation {
 
         if trimmed.count > Constants.groupNameMaxLength {
             return .invalid(.invalidGroupName(reason: "Name must be \(Constants.groupNameMaxLength) characters or less"))
+        }
+
+        // Check for inappropriate language
+        if containsProfanity(trimmed) != nil {
+            return .invalid(.invalidGroupName(reason: "Name contains inappropriate language"))
         }
 
         return .valid
@@ -181,6 +191,8 @@ enum Validation {
         return .valid
     }
 
+    // MARK: - Polygon Area Calculation (Shoelace Formula)
+
     /// Validates that the boundary area is within acceptable limits
     /// - Parameter boundary: Array of Coordinate objects
     /// - Returns: ValidationResult indicating if the area size is valid
@@ -200,7 +212,14 @@ enum Validation {
     }
 
     /// Calculates the area of a polygon in square meters using the Shoelace formula
-    /// with geodesic correction for Earth's curvature
+    /// with geodesic correction for Earth's curvature.
+    ///
+    /// The Shoelace formula sums cross-products of consecutive vertex pairs to
+    /// compute the signed area of a polygon. Here it operates on lat/lon converted
+    /// to radians, then scales by Earth's radius squared to produce square meters.
+    /// Accurate for small-to-medium polygons; for continent-scale areas, a full
+    /// spherical-excess integration would be needed.
+    ///
     /// - Parameter boundary: Array of Coordinate objects
     /// - Returns: Area in square meters
     static func calculatePolygonArea(_ boundary: [Coordinate]) -> Double {
@@ -312,7 +331,56 @@ enum Validation {
         return .valid
     }
 
-    // MARK: - Sanitization
+    // MARK: - Profanity Filter
+
+    /// Checks if a string contains inappropriate language
+    /// Returns the offending word if found, nil if clean
+    static func containsProfanity(_ text: String) -> String? {
+        let normalized = normalizeProfanity(text)
+        for word in ProfanityList.words {
+            // Check for whole-word matches using word boundaries
+            // This prevents false positives like "class" matching "ass"
+            let pattern = "\\b\(NSRegularExpression.escapedPattern(for: word))\\b"
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+               regex.firstMatch(in: normalized, range: NSRange(normalized.startIndex..., in: normalized)) != nil {
+                return word
+            }
+        }
+        return nil
+    }
+
+    /// Normalizes common character substitutions used to bypass filters
+    /// e.g., "@ss" -> "ass", "sh1t" -> "shit"
+    private static func normalizeProfanity(_ text: String) -> String {
+        var result = text.lowercased()
+        let substitutions: [Character: Character] = [
+            "@": "a",
+            "0": "o",
+            "1": "i",
+            "3": "e",
+            "$": "s",
+            "5": "s",
+            "!": "i",
+        ]
+        result = String(result.map { substitutions[$0] ?? $0 })
+        // Collapse repeated characters: "fuuuck" -> "fuck"
+        var collapsed = ""
+        var lastChar: Character?
+        var repeatCount = 0
+        for char in result {
+            if char == lastChar {
+                repeatCount += 1
+                if repeatCount < 2 { collapsed.append(char) }
+            } else {
+                collapsed.append(char)
+                repeatCount = 0
+            }
+            lastChar = char
+        }
+        return collapsed
+    }
+
+    // MARK: - Input Sanitization
 
     /// Sanitizes a display name by trimming whitespace
     /// - Parameter name: The name to sanitize

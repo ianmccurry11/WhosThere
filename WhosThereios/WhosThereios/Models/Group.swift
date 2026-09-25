@@ -16,6 +16,7 @@ enum PresenceDisplayMode: String, Codable {
 }
 
 enum GroupColor: String, Codable, CaseIterable {
+    // Free colors
     case blue = "blue"
     case green = "green"
     case red = "red"
@@ -24,6 +25,14 @@ enum GroupColor: String, Codable, CaseIterable {
     case pink = "pink"
     case teal = "teal"
     case yellow = "yellow"
+
+    // Premium colors
+    case gold = "gold"
+    case indigo = "indigo"
+    case mint = "mint"
+    case lavender = "lavender"
+    case coral = "coral"
+    case slate = "slate"
 
     var color: Color {
         switch self {
@@ -35,12 +44,19 @@ enum GroupColor: String, Codable, CaseIterable {
         case .pink: return .pink
         case .teal: return .teal
         case .yellow: return .yellow
+        case .gold: return Color(red: 1.0, green: 0.84, blue: 0.0)
+        case .indigo: return .indigo
+        case .mint: return .mint
+        case .lavender: return Color(red: 0.71, green: 0.49, blue: 0.86)
+        case .coral: return Color(red: 1.0, green: 0.50, blue: 0.31)
+        case .slate: return Color(red: 0.44, green: 0.50, blue: 0.56)
         }
     }
 
     var displayName: String {
         rawValue.capitalized
     }
+
 }
 
 struct Coordinate: Codable, Equatable {

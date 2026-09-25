@@ -11,6 +11,9 @@ import CoreLocation
 import FirebaseFirestore
 import FirebaseAuth
 
+/// Central Firestore data access layer. All database operations go through this service.
+/// Collections: users, groups, presence, friendRequests, counters, reports
+/// See FIRESTORE_SCHEMA.md for the complete data contract.
 @MainActor
 class FirestoreService: ObservableObject {
     static let shared = FirestoreService()
@@ -29,12 +32,41 @@ class FirestoreService: ObservableObject {
     private var analyticsService: AnalyticsService { AnalyticsService.shared }
     private var networkInspector: NetworkInspector { NetworkInspector.shared }
 
+    // MARK: - Cached Display Name
+
+    private static let cachedDisplayNameKey = "cachedUserDisplayName"
+    private static let cachedUserLevelKey = "cachedUserLevel"
+
+    /// Returns the locally cached displayName, available even before Firestore loads.
+    var cachedDisplayName: String? {
+        UserDefaults.standard.string(forKey: Self.cachedDisplayNameKey)
+    }
+
+    var cachedUserLevel: Int {
+        let level = UserDefaults.standard.integer(forKey: Self.cachedUserLevelKey)
+        return level > 0 ? level : 1
+    }
+
+    /// Persists the current user's displayName and level to UserDefaults.
+    private func cacheUserInfo() {
+        if let name = currentUser?.displayName {
+            UserDefaults.standard.set(name, forKey: Self.cachedDisplayNameKey)
+        }
+        UserDefaults.standard.set(currentUser?.level ?? 1, forKey: Self.cachedUserLevelKey)
+    }
+
+    /// Clears cached user info (call on sign-out / account deletion).
+    private func clearCachedUserInfo() {
+        UserDefaults.standard.removeObject(forKey: Self.cachedDisplayNameKey)
+        UserDefaults.standard.removeObject(forKey: Self.cachedUserLevelKey)
+    }
+
     // MARK: - Error Handling
 
     private func handleError(_ error: AppError) {
         lastError = error
         if error.shouldLog {
-            print("[FirestoreService] Error: \(error.errorDescription ?? "Unknown")")
+            AppLogger.debug("[FirestoreService] Error: \(error.errorDescription ?? "Unknown")")
         }
     }
 
@@ -42,7 +74,7 @@ class FirestoreService: ObservableObject {
         lastError = nil
     }
 
-    // MARK: - User Operations
+    // MARK: - User Operations (users collection)
 
     /// Creates a user document if it doesn't exist
     /// - Returns: true if a new user was created, false if user already existed
@@ -68,9 +100,11 @@ class FirestoreService: ObservableObject {
                 )
                 try userRef.setData(from: newUser)
                 self.currentUser = newUser
+                cacheUserInfo()
                 return true
             } else {
                 self.currentUser = try document.data(as: User.self)
+                cacheUserInfo()
 
                 // Migrate existing users without discriminator
                 if self.currentUser?.needsDiscriminatorMigration == true {
@@ -79,7 +113,7 @@ class FirestoreService: ObservableObject {
                 return false
             }
         } catch {
-            print("Error creating user: \(error)")
+            AppLogger.debug("Error creating user: \(error)")
             return false
         }
     }
@@ -117,7 +151,7 @@ class FirestoreService: ObservableObject {
                 return String(format: "%04d", value % 10000)  // Wrap at 10000
             }
         } catch {
-            print("Error getting sequential discriminator: \(error)")
+            AppLogger.debug("Error getting sequential discriminator: \(error)")
         }
 
         // Fallback: use timestamp-based discriminator
@@ -145,19 +179,19 @@ class FirestoreService: ObservableObject {
 
             self.currentUser?.discriminator = discriminator
             self.currentUser?.usernameTag = usernameTag
-            print("Migrated user discriminator: \(usernameTag)")
+            AppLogger.debug("Migrated user discriminator: \(usernameTag)")
         } catch {
-            print("Error migrating user discriminator: \(error)")
+            AppLogger.debug("Error migrating user discriminator: \(error)")
         }
     }
 
     func fetchCurrentUser() async {
         guard let userId = Auth.auth().currentUser?.uid else {
-            print("fetchCurrentUser: No user ID")
+            AppLogger.debug("fetchCurrentUser: No user ID")
             return
         }
 
-        print("fetchCurrentUser: Fetching user \(userId)")
+        AppLogger.debug("fetchCurrentUser: Fetching user \(userId)")
 
         let startTime = Date()
         do {
@@ -167,9 +201,13 @@ class FirestoreService: ObservableObject {
 
             if document.exists {
                 self.currentUser = try document.data(as: User.self)
-                print("fetchCurrentUser: Fetched user with \(self.currentUser?.joinedGroupIds.count ?? 0) groups")
+                cacheUserInfo()
+                AppLogger.debug("fetchCurrentUser: Fetched user with \(self.currentUser?.joinedGroupIds.count ?? 0) groups")
+
+                // Re-patch any active presences that were written with a nil displayName
+                await repatchPresencesIfNeeded()
             } else {
-                print("fetchCurrentUser: User document does not exist, creating one")
+                AppLogger.debug("fetchCurrentUser: User document does not exist, creating one")
                 // Create user document if it doesn't exist (for returning anonymous users)
                 await createUserIfNeeded(
                     userId: userId,
@@ -180,7 +218,7 @@ class FirestoreService: ObservableObject {
         } catch {
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logDocumentRead(collection: "users", documentId: userId, durationMs: duration, success: false, error: error)
-            print("Error fetching user: \(error)")
+            AppLogger.debug("Error fetching user: \(error)")
         }
     }
 
@@ -215,11 +253,68 @@ class FirestoreService: ObservableObject {
             ], merge: true)
             self.currentUser?.displayName = sanitizedName
             self.currentUser?.usernameTag = usernameTag
+            cacheUserInfo()
+
+            // Also persist to Firebase Auth profile — available immediately on app launch
+            // from Keychain, even before any Firestore fetch. This is the strongest
+            // safeguard against the "Unknown" name issue on background geofence wakes.
+            let changeRequest = Auth.auth().currentUser?.createProfileChangeRequest()
+            changeRequest?.displayName = sanitizedName
+            try? await changeRequest?.commitChanges()
+
+            await achievementService.recordDisplayNameSet()
             return .success(())
         } catch {
             let appError = AppError.userUpdateFailed(underlying: error)
             handleError(appError)
             return .failure(appError)
+        }
+    }
+
+    // MARK: - Favorite Groups
+
+    func isGroupFavorited(groupId: String) -> Bool {
+        currentUser?.favoriteGroupIds.contains(groupId) ?? false
+    }
+
+    func toggleFavoriteGroup(groupId: String) async {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        let isFavorited = isGroupFavorited(groupId: groupId)
+
+        do {
+            if isFavorited {
+                try await db.collection("users").document(userId).updateData([
+                    "favoriteGroupIds": FieldValue.arrayRemove([groupId])
+                ])
+                currentUser?.favoriteGroupIds.removeAll { $0 == groupId }
+            } else {
+                try await db.collection("users").document(userId).updateData([
+                    "favoriteGroupIds": FieldValue.arrayUnion([groupId])
+                ])
+                currentUser?.favoriteGroupIds.append(groupId)
+            }
+
+            // Sync updated favorites to widget
+            WidgetDataService.shared.syncToWidget()
+
+            // Track achievement for favorites count
+            let favoriteCount = currentUser?.favoriteGroupIds.count ?? 0
+            await achievementService.recordFavoriteCountChanged(count: favoriteCount)
+        } catch {
+            AppLogger.debug("Error toggling favorite: \(error)")
+        }
+    }
+
+    // MARK: - Fetch Group by ID
+
+    func fetchGroupById(_ groupId: String) async -> LocationGroup? {
+        do {
+            let doc = try await db.collection("groups").document(groupId).getDocument()
+            return try doc.data(as: LocationGroup.self)
+        } catch {
+            AppLogger.debug("Error fetching group by ID: \(error)")
+            return nil
         }
     }
 
@@ -236,7 +331,7 @@ class FirestoreService: ObservableObject {
 
             return snapshot.documents.first.flatMap { try? $0.data(as: User.self) }
         } catch {
-            print("Error searching user by tag: \(error)")
+            AppLogger.debug("Error searching user by tag: \(error)")
             return nil
         }
     }
@@ -256,7 +351,7 @@ class FirestoreService: ObservableObject {
                 try? doc.data(as: User.self)
             }.filter { $0.id != Auth.auth().currentUser?.uid }  // Exclude self
         } catch {
-            print("Error searching users: \(error)")
+            AppLogger.debug("Error searching users: \(error)")
             return []
         }
     }
@@ -266,14 +361,45 @@ class FirestoreService: ObservableObject {
             let document = try await db.collection("users").document(userId).getDocument()
             return try? document.data(as: User.self)
         } catch {
-            print("Error fetching user by ID: \(error)")
+            AppLogger.debug("Error fetching user by ID: \(error)")
+            return nil
+        }
+    }
+
+    // MARK: - Achievement Operations (users/{userId}/achievements subcollection)
+
+    /// Fetches the earned achievements for any user (used for public profile display).
+    /// Requires Firestore rules to allow reads on users/{userId}/achievements for authenticated users.
+    func fetchUserAchievements(userId: String) async -> [UserAchievement] {
+        do {
+            let snapshot = try await db.collection("users").document(userId)
+                .collection("achievements")
+                .order(by: "earnedAt", descending: true)
+                .getDocuments()
+            return snapshot.documents.compactMap { try? $0.data(as: UserAchievement.self) }
+        } catch {
+            AppLogger.debug("[FirestoreService] Error fetching achievements for \(userId): \(error)")
+            return []
+        }
+    }
+
+    /// Fetches public-facing stats for any user (used for public profile display).
+    /// Returns nil if the stats document doesn't exist or can't be read.
+    func fetchUserStats(userId: String) async -> UserStats? {
+        do {
+            let doc = try await db.collection("users").document(userId)
+                .collection("stats").document("current")
+                .getDocument()
+            return try? doc.data(as: UserStats.self)
+        } catch {
+            AppLogger.debug("[FirestoreService] Error fetching stats for \(userId): \(error)")
             return nil
         }
     }
 
     func updateAutoCheckOutMinutes(_ minutes: Int) async {
         guard let userId = Auth.auth().currentUser?.uid else {
-            print("Error updating auto check-out time: No user ID")
+            AppLogger.debug("Error updating auto check-out time: No user ID")
             return
         }
 
@@ -282,13 +408,13 @@ class FirestoreService: ObservableObject {
                 "autoCheckOutMinutes": minutes
             ], merge: true)
             self.currentUser?.autoCheckOutMinutes = minutes
-            print("Auto check-out time updated to \(minutes) minutes")
+            AppLogger.debug("Auto check-out time updated to \(minutes) minutes")
         } catch {
-            print("Error updating auto check-out time: \(error)")
+            AppLogger.debug("Error updating auto check-out time: \(error)")
         }
     }
 
-    // MARK: - Group Operations
+    // MARK: - Group Operations (groups collection)
 
     func createGroup(_ group: LocationGroup) async -> AppResult<String> {
         guard let userId = Auth.auth().currentUser?.uid else {
@@ -321,11 +447,11 @@ class FirestoreService: ObservableObject {
             let encoder = Firestore.Encoder()
             let groupData = try encoder.encode(validatedGroup)
 
-            print("[FirestoreService] Creating group with ID: \(groupId)")
+            AppLogger.debug("[FirestoreService] Creating group with ID: \(groupId)")
             try await newDocRef.setData(groupData)
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logDocumentWrite(collection: "groups", documentId: groupId, durationMs: duration, success: true)
-            print("[FirestoreService] Group document created successfully")
+            AppLogger.debug("[FirestoreService] Group document created successfully")
 
             // Update user's joinedGroupIds - do this in a separate try/catch so group creation still succeeds
             let userRef = db.collection("users").document(userId)
@@ -333,10 +459,10 @@ class FirestoreService: ObservableObject {
                 try await userRef.setData([
                     "joinedGroupIds": FieldValue.arrayUnion([groupId])
                 ], merge: true)
-                print("[FirestoreService] User joinedGroupIds updated successfully")
+                AppLogger.debug("[FirestoreService] User joinedGroupIds updated successfully")
             } catch {
                 // Log but don't fail - the group was created, we can recover by fetching
-                print("[FirestoreService] Warning: Failed to update user joinedGroupIds: \(error)")
+                AppLogger.debug("[FirestoreService] Warning: Failed to update user joinedGroupIds: \(error)")
             }
 
             // Always update local state
@@ -348,7 +474,7 @@ class FirestoreService: ObservableObject {
             var createdGroup = validatedGroup
             createdGroup.id = groupId
             self.joinedGroups.append(createdGroup)
-            print("[FirestoreService] Added group to local joinedGroups array")
+            AppLogger.debug("[FirestoreService] Added group to local joinedGroups array")
 
             // Track achievement for creating a group
             await achievementService.recordGroupCreated()
@@ -360,12 +486,12 @@ class FirestoreService: ObservableObject {
                 isPublic: validatedGroup.isPublic
             )
 
-            print("[FirestoreService] Group creation complete, returning success")
+            AppLogger.debug("[FirestoreService] Group creation complete, returning success")
             return .success(groupId)
         } catch {
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logDocumentWrite(collection: "groups", documentId: nil, durationMs: duration, success: false, error: error)
-            print("[FirestoreService] Group creation failed with error: \(error)")
+            AppLogger.debug("[FirestoreService] Group creation failed with error: \(error)")
             let appError = AppError.groupCreationFailed(underlying: error)
             handleError(appError)
             analyticsService.trackError(errorType: "group_creation_failed", context: "FirestoreService.createGroup", message: error.localizedDescription)
@@ -374,10 +500,10 @@ class FirestoreService: ObservableObject {
     }
 
     func fetchJoinedGroups() async {
-        print("fetchJoinedGroups() called")
+        AppLogger.debug("fetchJoinedGroups() called")
 
         guard let userId = Auth.auth().currentUser?.uid else {
-            print("No current user, clearing joined groups")
+            AppLogger.debug("No current user, clearing joined groups")
             joinedGroups = []
             return
         }
@@ -393,34 +519,37 @@ class FirestoreService: ObservableObject {
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logQuery(collection: "groups", durationMs: duration, resultCount: snapshot.documents.count, success: true)
 
-            print("Fetched \(snapshot.documents.count) group documents where user is member")
+            AppLogger.debug("Fetched \(snapshot.documents.count) group documents where user is member")
 
             self.joinedGroups = snapshot.documents.compactMap { doc in
                 do {
                     let group = try doc.data(as: LocationGroup.self)
-                    print("Decoded group: \(group.name)")
+                    AppLogger.debug("Decoded group: \(group.name)")
                     return group
                 } catch {
-                    print("Error decoding group \(doc.documentID): \(error)")
+                    AppLogger.debug("Error decoding group \(doc.documentID): \(error)")
                     return nil
                 }
             }
 
-            print("joinedGroups now has \(joinedGroups.count) groups")
+            AppLogger.debug("joinedGroups now has \(joinedGroups.count) groups")
 
             // Also update the currentUser's joinedGroupIds locally to stay in sync
             if self.currentUser != nil {
                 self.currentUser?.joinedGroupIds = self.joinedGroups.compactMap { $0.id }
             }
+
+            // Sync updated groups to widget
+            WidgetDataService.shared.syncToWidget()
         } catch {
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logQuery(collection: "groups", durationMs: duration, resultCount: 0, success: false, error: error)
-            print("Error fetching joined groups: \(error)")
+            AppLogger.debug("Error fetching joined groups: \(error)")
         }
     }
 
     func fetchPublicGroups() async {
-        print("fetchPublicGroups() called")
+        AppLogger.debug("fetchPublicGroups() called")
         let startTime = Date()
         do {
             let snapshot = try await db.collection("groups")
@@ -431,17 +560,17 @@ class FirestoreService: ObservableObject {
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logQuery(collection: "groups", durationMs: duration, resultCount: snapshot.documents.count, success: true)
 
-            print("Fetched \(snapshot.documents.count) public group documents")
+            AppLogger.debug("Fetched \(snapshot.documents.count) public group documents")
 
             self.publicGroups = snapshot.documents.compactMap { doc in
                 try? doc.data(as: LocationGroup.self)
             }
 
-            print("publicGroups now has \(publicGroups.count) groups")
+            AppLogger.debug("publicGroups now has \(publicGroups.count) groups")
         } catch {
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logQuery(collection: "groups", durationMs: duration, resultCount: 0, success: false, error: error)
-            print("Error fetching public groups: \(error)")
+            AppLogger.debug("Error fetching public groups: \(error)")
         }
     }
 
@@ -504,7 +633,7 @@ class FirestoreService: ObservableObject {
                     "joinedGroupIds": FieldValue.arrayUnion([groupId])
                 ], merge: true)
             } catch {
-                print("[FirestoreService] Warning: Failed to update user joinedGroupIds: \(error)")
+                AppLogger.debug("[FirestoreService] Warning: Failed to update user joinedGroupIds: \(error)")
             }
 
             // Update local state immediately
@@ -517,6 +646,11 @@ class FirestoreService: ObservableObject {
 
             // Track achievement for joining a group
             await achievementService.recordGroupJoined()
+
+            // Track private group achievement
+            if let joinedGroup = joinedGroups.first(where: { $0.id == groupId }), !joinedGroup.isPublic {
+                await achievementService.recordPrivateGroupJoined()
+            }
 
             // Track analytics
             analyticsService.trackGroupJoined(groupId: groupId, joinMethod: "direct")
@@ -556,7 +690,7 @@ class FirestoreService: ObservableObject {
                     "joinedGroupIds": FieldValue.arrayRemove([groupId])
                 ], merge: true)
             } catch {
-                print("[FirestoreService] Warning: Failed to update user joinedGroupIds: \(error)")
+                AppLogger.debug("[FirestoreService] Warning: Failed to update user joinedGroupIds: \(error)")
             }
 
             // Clean up presence (non-critical)
@@ -649,7 +783,7 @@ class FirestoreService: ObservableObject {
                 "presenceDisplayMode": presenceMode.rawValue
             ])
         } catch {
-            print("Error updating group settings: \(error)")
+            AppLogger.debug("Error updating group settings: \(error)")
         }
     }
 
@@ -657,15 +791,20 @@ class FirestoreService: ObservableObject {
         // Validate boundary before saving
         let validationResult = Validation.validateBoundary(boundary)
         guard validationResult.isValid else {
-            print("Invalid boundary: \(validationResult.error?.userMessage ?? "Unknown error")")
+            AppLogger.debug("Invalid boundary: \(validationResult.error?.userMessage ?? "Unknown error")")
             return
         }
 
         // Calculate new center coordinates
         let latitudes = boundary.map { $0.latitude }
         let longitudes = boundary.map { $0.longitude }
-        let centerLat = (latitudes.min()! + latitudes.max()!) / 2
-        let centerLon = (longitudes.min()! + longitudes.max()!) / 2
+        guard let minLat = latitudes.min(), let maxLat = latitudes.max(),
+              let minLon = longitudes.min(), let maxLon = longitudes.max() else {
+            AppLogger.debug("Cannot calculate center: empty boundary coordinates")
+            return
+        }
+        let centerLat = (minLat + maxLat) / 2
+        let centerLon = (minLon + maxLon) / 2
 
         // Convert boundary to Firestore format
         let boundaryData = boundary.map { ["latitude": $0.latitude, "longitude": $0.longitude] }
@@ -680,9 +819,9 @@ class FirestoreService: ObservableObject {
             // Update geofencing for this group
             await updateGeofenceForGroup(groupId: groupId, boundary: boundary)
 
-            print("Group boundary updated successfully")
+            AppLogger.debug("Group boundary updated successfully")
         } catch {
-            print("Error updating group boundary: \(error)")
+            AppLogger.debug("Error updating group boundary: \(error)")
         }
     }
 
@@ -701,15 +840,35 @@ class FirestoreService: ObservableObject {
 
             return snapshot.documents.first.flatMap { try? $0.data(as: LocationGroup.self) }
         } catch {
-            print("Error finding group by invite code: \(error)")
+            AppLogger.debug("Error finding group by invite code: \(error)")
             return nil
         }
     }
 
-    // MARK: - Presence Operations
+    // MARK: - Presence Operations (presence/{groupId}/members collection)
 
-    func updatePresence(groupId: String, isPresent: Bool, isManual: Bool) async {
+    func updatePresence(groupId: String, isPresent: Bool, isManual: Bool, expiresAt: Date? = nil) async {
         guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        // Use currentUser if available, then UserDefaults cache, then Firebase Auth profile.
+        // Auth profile is restored from Keychain on launch — no network needed.
+        // If none are available (background launch race), fetch the user doc next.
+        var displayName = currentUser?.displayName ?? cachedDisplayName ?? Auth.auth().currentUser?.displayName
+        var level = currentUser?.level ?? cachedUserLevel
+
+        if displayName == nil && isPresent {
+            // Background launch: currentUser not loaded yet and no cache.
+            // Fetch the user doc inline so we don't write "Unknown".
+            await fetchCurrentUser()
+            displayName = currentUser?.displayName ?? cachedDisplayName
+            level = currentUser?.level ?? cachedUserLevel
+        }
+
+        // Final fallback: never write nil displayName for a check-in.
+        // This covers the case where fetchCurrentUser() fails (network error, etc.)
+        let finalDisplayName: String? = isPresent
+            ? (displayName ?? "Player \(String(userId.prefix(4)))")
+            : displayName
 
         let presence = Presence(
             userId: userId,
@@ -717,14 +876,52 @@ class FirestoreService: ObservableObject {
             isPresent: isPresent,
             isManual: isManual,
             lastUpdated: Date(),
-            displayName: currentUser?.displayName
+            expiresAt: isPresent ? expiresAt : nil,  // Only set expiration when checking in
+            displayName: finalDisplayName,
+            level: level
         )
 
         do {
             try db.collection("presence").document(groupId)
                 .collection("members").document(userId).setData(from: presence)
         } catch {
-            print("Error updating presence: \(error)")
+            AppLogger.debug("Error updating presence: \(error)")
+        }
+    }
+
+    /// Re-patches any active presence documents that have a nil displayName.
+    /// Called after currentUser loads so we can fix presences written during the race window.
+    private func repatchPresencesIfNeeded() async {
+        guard let userId = Auth.auth().currentUser?.uid,
+              let displayName = currentUser?.displayName else { return }
+        let level = currentUser?.level ?? 1
+
+        for groupId in currentUser?.joinedGroupIds ?? [] {
+            do {
+                let docRef = db.collection("presence").document(groupId)
+                    .collection("members").document(userId)
+                let doc = try await docRef.getDocument()
+
+                guard doc.exists else { continue }
+
+                let data = doc.data() ?? [:]
+                let isPresent = data["isPresent"] as? Bool ?? false
+                let existingName = data["displayName"] as? String
+
+                // Patch if checked in and displayName is missing, empty, or "Unknown"
+                let needsPatch = existingName == nil || existingName?.isEmpty == true
+                    || existingName == "Unknown"
+                    || existingName?.hasPrefix("Player ") == true
+                if isPresent && needsPatch {
+                    try await docRef.setData([
+                        "displayName": displayName,
+                        "level": level
+                    ], merge: true)
+                    AppLogger.debug("Re-patched presence displayName for group \(groupId)")
+                }
+            } catch {
+                AppLogger.debug("Error re-patching presence for group \(groupId): \(error)")
+            }
         }
     }
 
@@ -745,7 +942,7 @@ class FirestoreService: ObservableObject {
         } catch {
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logQuery(collection: "presence/\(groupId)/members", durationMs: duration, resultCount: 0, success: false, error: error)
-            print("Error fetching presence: \(error)")
+            AppLogger.debug("Error fetching presence: \(error)")
             return []
         }
     }
@@ -771,10 +968,261 @@ class FirestoreService: ObservableObject {
         }
     }
 
+    // MARK: - Account Deletion
+
+    /// Deletes all user data from Firestore. Called during account deletion.
+    func deleteAllUserData(userId: String) async {
+        // 1. Remove user from all groups they're a member of
+        for group in joinedGroups {
+            guard let groupId = group.id else { continue }
+
+            // Remove from group memberIds
+            try? await db.collection("groups").document(groupId).updateData([
+                "memberIds": FieldValue.arrayRemove([userId])
+            ])
+
+            // Delete presence
+            try? await db.collection("presence").document(groupId)
+                .collection("members").document(userId).delete()
+        }
+
+        // 2. Delete groups owned by user
+        do {
+            let ownedGroups = try await db.collection("groups")
+                .whereField("ownerId", isEqualTo: userId)
+                .getDocuments()
+
+            for doc in ownedGroups.documents {
+                // Delete presence subcollection
+                let presenceDocs = try? await db.collection("presence").document(doc.documentID)
+                    .collection("members").getDocuments()
+                for presenceDoc in presenceDocs?.documents ?? [] {
+                    try? await presenceDoc.reference.delete()
+                }
+                // Delete messages subcollection
+                let messageDocs = try? await db.collection("groups").document(doc.documentID)
+                    .collection("messages").getDocuments()
+                for messageDoc in messageDocs?.documents ?? [] {
+                    try? await messageDoc.reference.delete()
+                }
+                // Delete the group
+                try? await doc.reference.delete()
+            }
+        } catch { }
+
+        // 3. Delete friend requests (sent and received)
+        do {
+            let sentRequests = try await db.collection("friendRequests")
+                .whereField("senderId", isEqualTo: userId).getDocuments()
+            for doc in sentRequests.documents {
+                try? await doc.reference.delete()
+            }
+
+            let receivedRequests = try await db.collection("friendRequests")
+                .whereField("receiverId", isEqualTo: userId).getDocuments()
+            for doc in receivedRequests.documents {
+                try? await doc.reference.delete()
+            }
+        } catch { }
+
+        // 4. Delete friends subcollection and remove from others' friend lists
+        do {
+            let friendsDocs = try await db.collection("users").document(userId)
+                .collection("friends").getDocuments()
+            for doc in friendsDocs.documents {
+                let friendId = doc.documentID
+                // Remove me from their friends
+                try? await db.collection("users").document(friendId)
+                    .collection("friends").document(userId).delete()
+                // Delete my friend entry
+                try? await doc.reference.delete()
+            }
+        } catch { }
+
+        // 5. Delete user subcollections (achievements, stats, notificationPreferences)
+        for subcollection in ["achievements", "stats", "notificationPreferences"] {
+            do {
+                let docs = try await db.collection("users").document(userId)
+                    .collection(subcollection).getDocuments()
+                for doc in docs.documents {
+                    try? await doc.reference.delete()
+                }
+            } catch { }
+        }
+
+        // 6. Delete the user document itself
+        try? await db.collection("users").document(userId).delete()
+
+        // 7. Clear local state
+        currentUser = nil
+        joinedGroups = []
+        publicGroups = []
+        nearbyGroups = []
+        clearCachedUserInfo()
+    }
+
     // MARK: - Invite Code
 
     func generateInviteCode() -> String {
         let characters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         return String((0..<6).map { _ in characters.randomElement()! })
+    }
+
+    // MARK: - Report Operations (reports collection)
+
+    /// Submits a user content report to Firestore
+    func submitReport(_ report: Report) async -> AppResult<Void> {
+        guard Auth.auth().currentUser?.uid != nil else {
+            return .failure(.notAuthenticated)
+        }
+
+        do {
+            try db.collection("reports").addDocument(from: report)
+            AppLogger.debug("[FirestoreService] Report submitted for user: \(report.reportedUserId)")
+            return .success(())
+        } catch {
+            AppLogger.debug("[FirestoreService] Error submitting report: \(error)")
+            return .failure(.serverError(underlying: error))
+        }
+    }
+
+    /// Checks if the current user has already reported a specific user recently (within 24 hours)
+    /// to prevent spam reports
+    func hasRecentReport(reportedUserId: String) async -> Bool {
+        guard let reporterId = Auth.auth().currentUser?.uid else { return false }
+
+        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)  // 24 hours ago
+
+        do {
+            let snapshot = try await db.collection("reports")
+                .whereField("reporterId", isEqualTo: reporterId)
+                .whereField("reportedUserId", isEqualTo: reportedUserId)
+                .whereField("createdAt", isGreaterThan: cutoff)
+                .limit(to: 1)
+                .getDocuments()
+
+            return !snapshot.documents.isEmpty
+        } catch {
+            AppLogger.debug("[FirestoreService] Error checking recent reports: \(error)")
+            return false
+        }
+    }
+
+    // MARK: - Leaderboard Operations (groups/{groupId}/leaderboard subcollection)
+
+    /// Updates the current user's leaderboard entry for a group on check-in.
+    /// Uses lazy monthly reset: if the stored month key differs from the current month,
+    /// resets monthlyCheckIns to 1 instead of incrementing.
+    func updateLeaderboardEntry(groupId: String) async {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+
+        let ref = db.collection("groups").document(groupId)
+            .collection("leaderboard").document(userId)
+
+        let currentMonth = LeaderboardEntry.currentMonthKey
+        let displayName = currentUser?.displayName ?? cachedDisplayName ?? Auth.auth().currentUser?.displayName ?? "Unknown"
+        let level = currentUser?.level ?? cachedUserLevel
+        let emoji = currentUser?.profileEmoji
+
+        do {
+            let doc = try await ref.getDocument()
+
+            if doc.exists, var entry = try? doc.data(as: LeaderboardEntry.self) {
+                // Existing entry — increment or reset monthly
+                entry.allTimeCheckIns += 1
+                if entry.currentMonthKey == currentMonth {
+                    entry.monthlyCheckIns += 1
+                } else {
+                    entry.monthlyCheckIns = 1
+                    entry.currentMonthKey = currentMonth
+                }
+                entry.lastCheckInAt = Date()
+                entry.displayName = displayName
+                entry.level = level
+                entry.profileEmoji = emoji
+
+                try ref.setData(from: entry, merge: true)
+            } else {
+                // New entry
+                let entry = LeaderboardEntry(
+                    userId: userId,
+                    displayName: displayName,
+                    level: level,
+                    profileEmoji: emoji,
+                    allTimeCheckIns: 1,
+                    monthlyCheckIns: 1,
+                    currentMonthKey: currentMonth,
+                    lastCheckInAt: Date()
+                )
+                try ref.setData(from: entry)
+            }
+        } catch {
+            AppLogger.debug("[FirestoreService] Error updating leaderboard: \(error)")
+        }
+    }
+
+    /// Fetches the leaderboard for a group, ordered by the given timeframe.
+    func fetchLeaderboard(groupId: String, timeframe: LeaderboardTimeframe) async -> [LeaderboardEntry] {
+        let orderField: String
+        switch timeframe {
+        case .monthly:
+            orderField = "monthlyCheckIns"
+        case .allTime:
+            orderField = "allTimeCheckIns"
+        }
+
+        do {
+            let snapshot = try await db.collection("groups").document(groupId)
+                .collection("leaderboard")
+                .order(by: orderField, descending: true)
+                .limit(to: 50)
+                .getDocuments()
+
+            var entries = snapshot.documents.compactMap { try? $0.data(as: LeaderboardEntry.self) }
+
+            // For monthly: filter out stale entries where month doesn't match
+            if timeframe == .monthly {
+                let currentMonth = LeaderboardEntry.currentMonthKey
+                entries = entries.filter { $0.currentMonthKey == currentMonth }
+            }
+
+            return entries
+        } catch {
+            AppLogger.debug("[FirestoreService] Error fetching leaderboard: \(error)")
+            return []
+        }
+    }
+
+    /// Fetches the top visitor this month for a group. Returns nil if no check-ins this month.
+    func fetchTopVisitor(groupId: String) async -> LeaderboardEntry? {
+        let entries = await fetchLeaderboard(groupId: groupId, timeframe: .monthly)
+        return entries.first
+    }
+
+    // MARK: - Batch User Fetch
+
+    /// Fetches multiple users by their IDs in batches of 10 (Firestore `in` query limit).
+    func fetchUsersByIds(_ ids: [String]) async -> [User] {
+        guard !ids.isEmpty else { return [] }
+
+        var allUsers: [User] = []
+        let batches = stride(from: 0, to: ids.count, by: 10).map {
+            Array(ids[$0..<min($0 + 10, ids.count)])
+        }
+
+        for batch in batches {
+            do {
+                let snapshot = try await db.collection("users")
+                    .whereField(FieldPath.documentID(), in: batch)
+                    .getDocuments()
+
+                let users = snapshot.documents.compactMap { try? $0.data(as: User.self) }
+                allUsers.append(contentsOf: users)
+            } catch {
+                AppLogger.debug("[FirestoreService] Error batch fetching users: \(error)")
+            }
+        }
+
+        return allUsers
     }
 }

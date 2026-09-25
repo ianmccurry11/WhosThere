@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Join Group - Who's There</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #6B4226 0%, #8B5E3C 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #FFF8F0;
+        }
+        .container {
+            text-align: center;
+            padding: 40px 24px;
+            max-width: 400px;
+        }
+        .icon { font-size: 64px; margin-bottom: 16px; }
+        h1 { font-size: 28px; margin-bottom: 8px; }
+        p { font-size: 16px; opacity: 0.85; margin-bottom: 32px; line-height: 1.5; }
+        .btn {
+            display: inline-block;
+            background: #FFF8F0;
+            color: #6B4226;
+            text-decoration: none;
+            padding: 14px 32px;
+            border-radius: 12px;
+            font-size: 17px;
+            font-weight: 600;
+            transition: transform 0.2s;
+        }
+        .btn:hover { transform: scale(1.05); }
+        .store-link {
+            display: block;
+            margin-top: 16px;
+            color: #FFF8F0;
+            opacity: 0.7;
+            font-size: 14px;
+            text-decoration: underline;
+        }
+    </style>
+    <script>
+        (function() {
+            var path = window.location.pathname;
+            var deepLink = 'whosthere:/' + path;
+
+            // Try to open the app via custom URL scheme
+            window.location.href = deepLink;
+
+            // If the app doesn't open after a delay, the page stays visible
+        })();
+    </script>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">📍</div>
+        <h1>Who's There</h1>
+        <p>You've been invited to join a group! Open the link in the app to continue.</p>
+        <a class="btn" href="javascript:void(0)" onclick="window.location.href='whosthere:/' + window.location.pathname">Open in App</a>
+        <a class="store-link" href="https://apps.apple.com/app/id0000000000">Don't have the app? Get it on the App Store</a>
+    </div>
+</body>
+</html>

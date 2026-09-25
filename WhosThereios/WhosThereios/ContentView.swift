@@ -18,6 +18,8 @@ struct ContentView: View {
             Group {
                 if !hasCompletedOnboarding {
                     OnboardingView(hasCompletedOnboarding: $hasCompletedOnboarding)
+                } else if authService.isAuthenticated && authService.isNewUser {
+                    NameInputView(authService: authService)
                 } else if authService.isAuthenticated {
                     HomeView()
                 } else {
@@ -25,6 +27,7 @@ struct ContentView: View {
                 }
             }
             .animation(.easeInOut, value: authService.isAuthenticated)
+            .animation(.easeInOut, value: authService.isNewUser)
             .animation(.easeInOut, value: hasCompletedOnboarding)
 
             // Splash screen overlay

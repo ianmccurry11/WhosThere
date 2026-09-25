@@ -15,7 +15,11 @@ struct Presence: Identifiable, Codable {
     var isPresent: Bool
     var isManual: Bool
     var lastUpdated: Date
+    var expiresAt: Date?  // When this presence should auto-expire (nil = no expiration set)
     var displayName: String?
+    var isPremium: Bool?
+    var profileEmoji: String?
+    var level: Int?
 
     init(
         id: String? = nil,
@@ -24,7 +28,11 @@ struct Presence: Identifiable, Codable {
         isPresent: Bool,
         isManual: Bool = false,
         lastUpdated: Date = Date(),
-        displayName: String? = nil
+        expiresAt: Date? = nil,
+        displayName: String? = nil,
+        isPremium: Bool? = nil,
+        profileEmoji: String? = nil,
+        level: Int? = nil
     ) {
         self.id = id
         self.userId = userId
@@ -32,7 +40,17 @@ struct Presence: Identifiable, Codable {
         self.isPresent = isPresent
         self.isManual = isManual
         self.lastUpdated = lastUpdated
+        self.expiresAt = expiresAt
         self.displayName = displayName
+        self.isPremium = isPremium
+        self.profileEmoji = profileEmoji
+        self.level = level
+    }
+
+    /// Whether this presence has passed its expiration time
+    var isExpired: Bool {
+        guard let expiresAt else { return false }
+        return Date() >= expiresAt
     }
 }
 

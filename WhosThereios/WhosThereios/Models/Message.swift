@@ -14,6 +14,7 @@ struct Message: Codable, Identifiable, Equatable {
     let groupId: String
     let senderId: String
     let senderName: String
+    let senderIsPremium: Bool?
     let text: String
     let createdAt: Date
 
@@ -29,10 +30,11 @@ struct Message: Codable, Identifiable, Equatable {
     /// Minimum time between messages from same user (seconds)
     static let rateLimitSeconds: TimeInterval = 2
 
-    init(groupId: String, senderId: String, senderName: String, text: String) {
+    init(groupId: String, senderId: String, senderName: String, senderIsPremium: Bool? = nil, text: String) {
         self.groupId = groupId
         self.senderId = senderId
         self.senderName = senderName
+        self.senderIsPremium = senderIsPremium
         self.text = String(text.prefix(Message.maxMessageLength))
         self.createdAt = Date()
     }

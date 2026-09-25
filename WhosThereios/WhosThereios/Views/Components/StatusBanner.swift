@@ -25,9 +25,9 @@ struct StatusBanner: View {
         var backgroundColor: Color {
             switch self {
             case .error: return .red
-            case .warning: return .appTan
-            case .success: return .appOliveGreen
-            case .info: return .appBrown
+            case .warning: return .appAmber
+            case .success: return Color(hex: "34C759") // iOS green
+            case .info: return .appBlue
             case .offline: return .gray
             }
         }
@@ -66,6 +66,7 @@ struct StatusBanner: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(type.backgroundColor)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -96,7 +97,7 @@ struct ErrorToast: View {
             VStack {
                 StatusBanner(message: message, type: .error)
                     .cornerRadius(12)
-                    .shadow(color: .black.opacity(0.2), radius: 10, y: 5)
+                    .shadow(color: .appShadow, radius: 10, y: 5)
                     .padding(.horizontal)
                     .padding(.top, 60)
 
@@ -147,7 +148,7 @@ struct EmptyStateView: View {
                         .foregroundColor(.white)
                         .padding(.horizontal, 24)
                         .padding(.vertical, 12)
-                        .background(Color.appBrown)
+                        .background(Color.appCoral)
                         .cornerRadius(10)
                 }
                 .padding(.top, 8)

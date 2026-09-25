@@ -13,15 +13,22 @@ struct ProfileView: View {
     @ObservedObject private var firestoreService = FirestoreService.shared
     @ObservedObject private var presenceService = PresenceService.shared
     @ObservedObject private var achievementService = AchievementService.shared
+    @ObservedObject private var levelService = LevelService.shared
     @ObservedObject var authService: AuthService
+    var startEditingName: Bool = false
 
     @State private var displayName = ""
     @State private var isEditingName = false
+    @FocusState private var isNameFieldFocused: Bool
     @State private var showSignOutConfirmation = false
     @State private var showClearPresenceConfirmation = false
     @State private var selectedAutoCheckOutMinutes: Int = 60
+    @State private var showDeleteAccountConfirmation = false
+    @State private var isDeletingAccount = false
+    #if DEBUG
     @State private var showAnalyticsDashboard = false
     @State private var versionTapCount = 0
+    #endif
 
     var body: some View {
         NavigationStack {
@@ -40,11 +47,13 @@ struct ProfileView: View {
                                 .fontWeight(.semibold)
                                 .foregroundColor(.blue)
                         }
+                        .accessibilityHidden(true)
 
                         VStack(alignment: .leading, spacing: 4) {
                             if isEditingName {
                                 TextField("Display Name", text: $displayName)
                                     .textFieldStyle(.roundedBorder)
+                                    .focused($isNameFieldFocused)
                                     .onSubmit {
                                         Task {
                                             await saveName()
@@ -77,8 +86,7 @@ struct ProfileView: View {
                                     await saveName()
                                 }
                             } else {
-                                displayName = firestoreService.currentUser?.displayName ?? ""
-                                isEditingName = true
+                                beginEditingName()
                             }
                         }
                         .buttonStyle(.borderless)
@@ -135,6 +143,61 @@ struct ProfileView: View {
                     }
                 }
 
+                // Level & XP Section
+                Section {
+                    VStack(spacing: 8) {
+                        HStack {
+                            LevelBadge(level: levelService.currentLevel.level)
+                            Text(levelService.currentLevel.tierName)
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            Spacer()
+                            Text("\(levelService.totalXP) XP")
+                                .font(.subheadline)
+                                .foregroundColor(.blue)
+                        }
+
+                        // Progress bar to next level
+                        if !levelService.currentLevel.isMaxLevel {
+                            GeometryReader { geo in
+                                ZStack(alignment: .leading) {
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(Color.gray.opacity(0.2))
+                                        .frame(height: 6)
+                                    RoundedRectangle(cornerRadius: 4)
+                                        .fill(
+                                            LinearGradient(
+                                                colors: [.blue, .purple],
+                                                startPoint: .leading,
+                                                endPoint: .trailing
+                                            )
+                                        )
+                                        .frame(
+                                            width: geo.size.width * CGFloat(levelService.currentLevel.progressToNextLevel),
+                                            height: 6
+                                        )
+                                }
+                            }
+                            .frame(height: 6)
+
+                            HStack {
+                                Text("\(levelService.currentLevel.xpToNextLevel) XP to Level \(levelService.currentLevel.level + 1)")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                            }
+                        } else {
+                            HStack {
+                                Text("Max level reached!")
+                                    .font(.caption2)
+                                    .foregroundColor(.purple)
+                                Spacer()
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+
                 // Current Status Section
                 Section("Current Status") {
                     let joinedGroups = firestoreService.joinedGroups
@@ -156,6 +219,7 @@ struct ProfileView: View {
                                             Circle()
                                                 .fill(Color.green)
                                                 .frame(width: 8, height: 8)
+                                                .accessibilityHidden(true)
                                             Text("You're here")
                                                 .font(.caption)
                                                 .foregroundColor(.green)
@@ -173,6 +237,7 @@ struct ProfileView: View {
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
+                            .accessibilityElement(children: .combine)
                         }
                     }
                 }
@@ -186,6 +251,7 @@ struct ProfileView: View {
                         }
                     }
                     .disabled(firestoreService.joinedGroups.isEmpty)
+                    .accessibilityHint("Marks you as not present at all your groups")
                 }
 
                 // Location & Timer Settings
@@ -193,6 +259,7 @@ struct ProfileView: View {
                     HStack {
                         Image(systemName: "location.fill")
                             .foregroundColor(presenceService.hasAlwaysLocationPermission ? .green : .orange)
+                            .accessibilityHidden(true)
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Location Permission")
                                 .font(.subheadline)
@@ -247,11 +314,82 @@ struct ProfileView: View {
                         }
                         .foregroundColor(.red)
                     }
+
+                    Button(action: { showDeleteAccountConfirmation = true }) {
+                        HStack {
+                            if isDeletingAccount {
+                                ProgressView()
+                                    .tint(.red)
+                            } else {
+                                Image(systemName: "trash")
+                            }
+                            Text("Delete Account")
+                        }
+                        .foregroundColor(.red)
+                    }
+                    .disabled(isDeletingAccount)
+                }
+
+                // Share & Support
+                Section {
+                    ShareLink(item: URL(string: "https://apps.apple.com/app/id6758129477")!) {
+                        HStack {
+                            Image(systemName: "square.and.arrow.up")
+                                .foregroundColor(.blue)
+                            Text("Share Who's There")
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .simultaneousGesture(TapGesture().onEnded {
+                        Task { await AchievementService.shared.recordAppShared() }
+                    })
+
+                    Button {
+                        requestAppReview()
+                    } label: {
+                        HStack {
+                            Image(systemName: "star.fill")
+                                .foregroundColor(.yellow)
+                            Text("Rate Who's There")
+                            Spacer()
+                            Image(systemName: "arrow.up.right.square")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Enjoying the app?")
+                }
+
+                // Legal
+                Section {
+                    Link(destination: URL(string: "https://ianmccurry11.github.io/whosthere-privacy/")!) {
+                        HStack {
+                            Image(systemName: "hand.raised")
+                            Text("Privacy Policy")
+                            Spacer()
+                            Image(systemName: "arrow.up.right.square")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
                 }
 
                 // App Info
                 Section {
+                    #if DEBUG
                     versionRow
+                    #else
+                    HStack {
+                        Text("Version")
+                        Spacer()
+                        Text(appVersion)
+                            .foregroundColor(.secondary)
+                    }
+                    #endif
                 }
             }
             .navigationTitle("Profile")
@@ -283,23 +421,52 @@ struct ProfileView: View {
         } message: {
             Text("This will mark you as not present at all locations.")
         }
+        .alert("Delete Account?", isPresented: $showDeleteAccountConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                Task {
+                    isDeletingAccount = true
+                    let success = await authService.deleteAccount()
+                    isDeletingAccount = false
+                    if success {
+                        dismiss()
+                    }
+                }
+            }
+        } message: {
+            Text("This will permanently delete your account, all your groups, messages, achievements, and friends. This action cannot be undone.")
+        }
         .onAppear {
             // Load saved auto check-out time
             selectedAutoCheckOutMinutes = firestoreService.currentUser?.autoCheckOutMinutes ?? 60
 
             // Track screen view
             AnalyticsService.shared.trackScreenView("profile")
+
+            // Auto-start name editing if opened from the nudge banner
+            if startEditingName && !isEditingName {
+                beginEditingName()
+            }
         }
+        #if DEBUG
         .sheet(isPresented: $showAnalyticsDashboard) {
             AnalyticsDashboardView()
         }
+        #endif
     }
 
+    private var appVersion: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "\(version) (\(build))"
+    }
+
+    #if DEBUG
     private var versionRow: some View {
         HStack {
             Text("Version")
             Spacer()
-            Text("1.0.0")
+            Text(appVersion)
                 .foregroundColor(.secondary)
         }
         .contentShape(Rectangle())
@@ -312,6 +479,7 @@ struct ProfileView: View {
             }
         }
     }
+    #endif
 
     private var initials: String {
         guard let name = firestoreService.currentUser?.displayName else { return "?" }
@@ -320,6 +488,20 @@ struct ProfileView: View {
             return "\(components[0].prefix(1))\(components[1].prefix(1))".uppercased()
         }
         return String(name.prefix(2)).uppercased()
+    }
+
+    private func beginEditingName() {
+        displayName = firestoreService.currentUser?.displayName ?? ""
+        isEditingName = true
+        // Delay focus slightly so the TextField has time to appear
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            isNameFieldFocused = true
+        }
+    }
+
+    private func requestAppReview() {
+        guard let url = URL(string: "https://apps.apple.com/app/id6758129477?action=write-review") else { return }
+        UIApplication.shared.open(url)
     }
 
     private func saveName() async {

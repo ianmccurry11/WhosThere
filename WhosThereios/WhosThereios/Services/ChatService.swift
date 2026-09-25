@@ -49,7 +49,8 @@ class ChatService: ObservableObject {
                 self.isLoading = false
 
                 if let error = error {
-                    self.error = "Failed to load messages: \(error.localizedDescription)"
+                    AppLogger.debug("Failed to load messages: \(error.localizedDescription)")
+                    self.error = "Couldn't load messages. Please check your connection and try again."
                     return
                 }
 
@@ -122,6 +123,10 @@ class ChatService: ObservableObject {
             // Track analytics
             analyticsService.trackMessageSent(groupId: groupId, messageLength: trimmedText.count)
 
+            // Track achievement
+            let isFirstInGroup = messages.isEmpty || messages.allSatisfy { $0.senderId != userId }
+            await AchievementService.shared.recordMessageSent(groupId: groupId, isFirstMessageInGroup: isFirstInGroup)
+
             // Cleanup old messages in background
             Task {
                 await cleanupOldMessages()
@@ -129,7 +134,8 @@ class ChatService: ObservableObject {
 
             return true
         } catch {
-            self.error = "Failed to send message: \(error.localizedDescription)"
+            AppLogger.debug("Failed to send message: \(error.localizedDescription)")
+            self.error = "Message couldn't be sent. Please try again."
             analyticsService.trackError(errorType: "message_send_failed", context: "ChatService.sendMessage", message: error.localizedDescription)
             return false
         }
@@ -145,7 +151,7 @@ class ChatService: ObservableObject {
                 return name
             }
         } catch {
-            print("Error fetching sender name: \(error)")
+            AppLogger.debug("Error fetching sender name: \(error)")
         }
         return "Unknown"
     }
@@ -172,10 +178,10 @@ class ChatService: ObservableObject {
             }
 
             if !oldMessages.documents.isEmpty {
-                print("Cleaned up \(oldMessages.documents.count) old messages")
+                AppLogger.debug("Cleaned up \(oldMessages.documents.count) old messages")
             }
         } catch {
-            print("Error cleaning up old messages: \(error)")
+            AppLogger.debug("Error cleaning up old messages: \(error)")
         }
     }
 
@@ -195,10 +201,10 @@ class ChatService: ObservableObject {
                 for doc in toDelete {
                     try? await doc.reference.delete()
                 }
-                print("Pruned \(excessCount) excess messages")
+                AppLogger.debug("Pruned \(excessCount) excess messages")
             }
         } catch {
-            print("Error pruning messages: \(error)")
+            AppLogger.debug("Error pruning messages: \(error)")
         }
     }
 }
@@ -219,7 +225,7 @@ extension ChatService {
 
             return snapshot.documents.count
         } catch {
-            print("Error getting unread count: \(error)")
+            AppLogger.debug("Error getting unread count: \(error)")
             return 0
         }
     }

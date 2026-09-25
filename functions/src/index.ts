@@ -7,6 +7,7 @@
  */
 
 import * as functions from "firebase-functions";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as admin from "firebase-admin";
 
 admin.initializeApp();
@@ -293,6 +294,64 @@ export const onNewMessage = functions.firestore
       return null;
     }
   });
+
+/**
+ * Nightly cleanup of stale presences at 2:00 AM EST
+ * Clears any presence records where isPresent is true and lastUpdated is older than 5 hours
+ */
+export const nightlyPresenceCleanup = onSchedule(
+  {
+    schedule: "0 2 * * *",
+    timeZone: "America/New_York",
+  },
+  async () => {
+    const fiveHoursAgo = admin.firestore.Timestamp.fromDate(
+      new Date(Date.now() - 5 * 60 * 60 * 1000)
+    );
+
+    console.log(
+      `Running nightly presence cleanup. Clearing presences older than ${fiveHoursAgo.toDate().toISOString()}`
+    );
+
+    // Get all groups
+    const groupsSnapshot = await db.collection("groups").get();
+    let totalCleaned = 0;
+
+    for (const groupDoc of groupsSnapshot.docs) {
+      const groupId = groupDoc.id;
+
+      // Find stale presence records in this group
+      const stalePresences = await db
+        .collection("presence")
+        .doc(groupId)
+        .collection("members")
+        .where("isPresent", "==", true)
+        .where("lastUpdated", "<", fiveHoursAgo)
+        .get();
+
+      if (stalePresences.empty) continue;
+
+      // Batch update stale presences to checked out
+      const batch = db.batch();
+      for (const doc of stalePresences.docs) {
+        batch.update(doc.ref, {
+          isPresent: false,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      await batch.commit();
+      totalCleaned += stalePresences.size;
+      console.log(
+        `Cleaned ${stalePresences.size} stale presences in group ${groupId} (${groupDoc.data().name})`
+      );
+    }
+
+    console.log(
+      `Nightly cleanup complete. Total stale presences cleared: ${totalCleaned}`
+    );
+  }
+);
 
 /**
  * Clean up invalid FCM tokens from the database

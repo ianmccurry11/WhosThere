@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.WhosThere" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- Primary brand color -->
+        <item name="colorPrimary">@color/appBlue</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <item name="colorPrimaryContainer">@color/appLightBlue</item>
+        <item name="colorOnPrimaryContainer">@color/appNavy</item>
+
+        <!-- Secondary brand color -->
+        <item name="colorSecondary">@color/appAmber</item>
+        <item name="colorOnSecondary">@color/white</item>
+
+        <!-- Tertiary brand color -->
+        <item name="colorTertiary">@color/appCoral</item>
+        <item name="colorOnTertiary">@color/white</item>
+
+        <!-- Background and surface -->
+        <item name="android:colorBackground">@color/white</item>
+        <item name="colorSurface">@color/white</item>
+        <item name="colorOnSurface">@color/appNavy</item>
+
+        <!-- Status bar -->
+        <item name="android:statusBarColor">@color/appNavy</item>
+    </style>
+
+</resources>

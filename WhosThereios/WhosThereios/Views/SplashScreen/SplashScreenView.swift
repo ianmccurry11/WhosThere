@@ -15,7 +15,7 @@ struct SplashScreenView: View {
         ZStack {
             // Background gradient
             LinearGradient(
-                colors: [Color.blue, Color.blue.opacity(0.8)],
+                colors: [Color.appNavy, Color.appBlue],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )

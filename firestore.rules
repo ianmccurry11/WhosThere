@@ -57,24 +57,28 @@ service cloud.firestore {
       // Users can only delete their own document
       allow delete: if isOwner(userDocId);
 
-      // Achievements subcollection - users can only access their own
+      // Achievements subcollection - any authenticated user can read (for public profiles)
       match /achievements/{achievementId} {
-        allow read: if isOwner(userDocId);
+        allow read: if isAuthenticated();
         allow create, update: if isOwner(userDocId)
           && request.resource.data.userId == userId();
         allow delete: if isOwner(userDocId);
       }
 
-      // Stats subcollection - users can only access their own
+      // Stats subcollection - any authenticated user can read (for public profiles)
       match /stats/{statId} {
-        allow read: if isOwner(userDocId);
+        allow read: if isAuthenticated();
         allow create, update: if isOwner(userDocId);
         allow delete: if isOwner(userDocId);
       }
 
-      // Friends subcollection - users can only access their own friends
+      // Friends subcollection
       match /friends/{friendId} {
+        // Owner can read/write their own friends list
         allow read, write: if isOwner(userDocId);
+        // Another user can add themselves as a friend (mutual creation during accept)
+        // Only allows creating a doc where friendId == the requester's UID
+        allow create: if isAuthenticated() && friendId == userId();
       }
 
       // Notification preferences subcollection - users can only access their own
@@ -148,10 +152,10 @@ service cloud.firestore {
           && isValidLongitude(data.centerLongitude);
       }
 
-      // Public groups: anyone authenticated can read
-      // Private groups: only members can read
-      allow read: if isAuthenticated()
-        && (resource.data.isPublic == true || isMember());
+      // Any authenticated user can read group documents
+      // This enables: public group discovery, invite code lookups, deep link joining
+      // Write access is still restricted to members/owners
+      allow read: if isAuthenticated();
 
       // Any authenticated user can create a group
       // They must set themselves as the owner and first member
@@ -178,6 +182,18 @@ service cloud.firestore {
           ||
           // Any authenticated user can join a public group
           (resource.data.isPublic == true
+            && willBeMember()
+            && request.resource.data.name == resource.data.name
+            && request.resource.data.isPublic == resource.data.isPublic
+            && request.resource.data.ownerId == resource.data.ownerId
+            && request.resource.data.boundary == resource.data.boundary
+            && request.resource.data.centerLatitude == resource.data.centerLatitude
+            && request.resource.data.centerLongitude == resource.data.centerLongitude)
+          ||
+          // Any authenticated user can join a private group that has an invite code
+          // (invite code validation is handled app-side via findGroupByInviteCode)
+          (resource.data.isPublic == false
+            && resource.data.inviteCode is string
             && willBeMember()
             && request.resource.data.name == resource.data.name
             && request.resource.data.isPublic == resource.data.isPublic
@@ -219,6 +235,25 @@ service cloud.firestore {
 
         // No updates allowed - messages are immutable
         allow update: if false;
+      }
+
+      // Leaderboard subcollection - per-user visit stats
+      match /leaderboard/{leaderboardUserId} {
+        function isGroupMemberForLeaderboard() {
+          let groupDoc = get(/databases/$(database)/documents/groups/$(groupId));
+          return isAuthenticated() && userId() in groupDoc.data.memberIds;
+        }
+
+        // Members can read leaderboard entries
+        allow read: if isGroupMemberForLeaderboard();
+
+        // Users can only create/update their own leaderboard entry
+        allow create, update: if isAuthenticated()
+          && isOwner(leaderboardUserId)
+          && request.resource.data.userId == userId();
+
+        // No deletes
+        allow delete: if false;
       }
 
       // Daily first arrival tracking for Early Bird achievement
@@ -277,6 +312,29 @@ service cloud.firestore {
       allow read: if isAuthenticated();
       allow create, update: if isAuthenticated();
       allow delete: if false;  // Never delete counters
+    }
+
+    // ============================================
+    // REPORTS COLLECTION
+    // ============================================
+
+    match /reports/{reportId} {
+      // Reporter can read their own reports (needed for duplicate-report check)
+      allow read: if isAuthenticated()
+        && resource.data.reporterId == userId();
+
+      // Authenticated users can create reports (must be the reporter)
+      allow create: if isAuthenticated()
+        && request.resource.data.reporterId == userId()
+        && isValidString(request.resource.data.reportedUserId, 1, 128)
+        && isValidString(request.resource.data.reportedDisplayName, 1, 50)
+        && request.resource.data.reason is string
+        && request.resource.data.context is string
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt is timestamp;
+
+      // Reports cannot be updated or deleted by users
+      allow update, delete: if false;
     }
 
     // ============================================

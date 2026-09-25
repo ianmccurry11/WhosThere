@@ -50,7 +50,7 @@ class NotificationService: NSObject, ObservableObject {
 
             return granted
         } catch {
-            print("Error requesting notification permission: \(error)")
+            AppLogger.debug("Error requesting notification permission: \(error)")
             return false
         }
     }
@@ -81,9 +81,9 @@ class NotificationService: NSObject, ObservableObject {
             try await db.collection("users").document(userId).setData([
                 "fcmToken": token
             ], merge: true)
-            print("FCM token updated in Firestore")
+            AppLogger.debug("FCM token updated in Firestore")
         } catch {
-            print("Error updating FCM token: \(error)")
+            AppLogger.debug("Error updating FCM token: \(error)")
         }
     }
 
@@ -95,9 +95,9 @@ class NotificationService: NSObject, ObservableObject {
                 "fcmToken": FieldValue.delete()
             ])
             fcmToken = nil
-            print("FCM token cleared")
+            AppLogger.debug("FCM token cleared")
         } catch {
-            print("Error clearing FCM token: \(error)")
+            AppLogger.debug("Error clearing FCM token: \(error)")
         }
     }
 
@@ -121,7 +121,7 @@ class NotificationService: NSObject, ObservableObject {
             }
             return nil
         } catch {
-            print("Error fetching notification preferences: \(error)")
+            AppLogger.debug("Error fetching notification preferences: \(error)")
             return nil
         }
     }
@@ -133,9 +133,9 @@ class NotificationService: NSObject, ObservableObject {
             try db.collection("users").document(userId)
                 .collection("notificationPreferences").document(groupId)
                 .setData(from: preferences, merge: true)
-            print("Notification preferences updated for group: \(groupId)")
+            AppLogger.debug("Notification preferences updated for group: \(groupId)")
         } catch {
-            print("Error updating notification preferences: \(error)")
+            AppLogger.debug("Error updating notification preferences: \(error)")
         }
     }
 
@@ -146,7 +146,7 @@ class NotificationService: NSObject, ObservableObject {
             try await db.collection("users").document(userId)
                 .collection("notificationPreferences").document(groupId).delete()
         } catch {
-            print("Error deleting notification preferences: \(error)")
+            AppLogger.debug("Error deleting notification preferences: \(error)")
         }
     }
 
@@ -171,7 +171,7 @@ class NotificationService: NSObject, ObservableObject {
 
         UNUserNotificationCenter.current().add(request) { error in
             if let error = error {
-                print("Error sending local notification: \(error)")
+                AppLogger.debug("Error sending local notification: \(error)")
             }
         }
     }
@@ -179,8 +179,9 @@ class NotificationService: NSObject, ObservableObject {
     // MARK: - Friend Arrival Notification
 
     func notifyFriendArrival(friendName: String, groupName: String, groupEmoji: String, groupId: String) {
+        let displayEmoji = GroupIcon.fallbackEmoji(for: groupEmoji)
         sendLocalNotification(
-            title: "\(groupEmoji) \(friendName) arrived!",
+            title: "\(displayEmoji) \(friendName) arrived!",
             body: "\(friendName) just checked in at \(groupName)",
             groupId: groupId
         )
@@ -237,7 +238,7 @@ extension NotificationService: UNUserNotificationCenterDelegate {
 extension NotificationService: MessagingDelegate {
     nonisolated func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
         guard let token = fcmToken else { return }
-        print("FCM token received: \(token)")
+        AppLogger.debug("FCM token received: \(token)")
 
         Task { @MainActor in
             await self.updateFCMToken(token)
