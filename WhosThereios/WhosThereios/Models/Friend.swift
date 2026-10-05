@@ -19,6 +19,8 @@ struct Friend: Identifiable, Codable {
     var displayName: String?
     var usernameTag: String?
     var discriminator: String?
+    var isPremium: Bool?
+    var profileEmoji: String?
 
     var fullUsername: String? {
         guard let name = displayName, let disc = discriminator else { return nil }

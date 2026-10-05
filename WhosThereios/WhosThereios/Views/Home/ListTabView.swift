@@ -13,10 +13,13 @@ struct ListTabView: View {
     @ObservedObject private var firestoreService = FirestoreService.shared
     @ObservedObject private var presenceService = PresenceService.shared
 
+    @AppStorage("nearbyRadiusKm") private var nearbyRadiusKm: Double = 50
     @State private var searchText = ""
     @State private var selectedGroup: LocationGroup?
     @State private var showJoinByCode = false
     @State private var inviteCode = ""
+
+    private static let radiusSteps: [Double] = [1, 2, 5, 10, 25, 50]
 
     var body: some View {
         ScrollView {
@@ -40,15 +43,29 @@ struct ListTabView: View {
                             .background(Color(.systemGray6))
                             .cornerRadius(12)
                     }
+                    .accessibilityLabel("Join by invite code")
                 }
                 .padding(.horizontal)
                 .padding(.top, 8)
 
-                // Joined Groups Section
-                if !joinedGroups.isEmpty {
+                // Favorite Groups Section
+                if !favoriteGroups.isEmpty {
+                    GroupSection(
+                        title: "Favorites",
+                        groups: favoriteGroups,
+                        showFavoriteToggle: true,
+                        onGroupTap: { group in
+                            selectedGroup = group
+                        }
+                    )
+                }
+
+                // Joined Groups Section (excluding favorites)
+                if !nonFavoriteJoinedGroups.isEmpty {
                     GroupSection(
                         title: "Your Groups",
-                        groups: joinedGroups,
+                        groups: nonFavoriteJoinedGroups,
+                        showFavoriteToggle: true,
                         onGroupTap: { group in
                             selectedGroup = group
                         }
@@ -56,18 +73,64 @@ struct ListTabView: View {
                 }
 
                 // Public Groups Section
-                if !publicGroups.isEmpty {
-                    GroupSection(
-                        title: "Public Groups Nearby",
-                        groups: publicGroups,
-                        onGroupTap: { group in
-                            selectedGroup = group
+                if !filteredPublicGroups.isEmpty || !publicGroups.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        // Section header with radius picker
+                        HStack {
+                            Text("Public Groups Nearby")
+                                .font(.headline)
+
+                            Spacer()
+
+                            Menu {
+                                ForEach(Self.radiusSteps, id: \.self) { km in
+                                    Button {
+                                        nearbyRadiusKm = km
+                                    } label: {
+                                        HStack {
+                                            Text(km < 50 ? "\(Int(km)) km" : "50+ km")
+                                            if nearbyRadiusKm == km {
+                                                Image(systemName: "checkmark")
+                                            }
+                                        }
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "line.3.horizontal.decrease.circle")
+                                        .font(.subheadline)
+                                    Text(nearbyRadiusKm < 50 ? "\(Int(nearbyRadiusKm)) km" : "All")
+                                        .font(.subheadline)
+                                }
+                                .foregroundColor(.secondary)
+                            }
+                            .accessibilityLabel("Filter radius: \(nearbyRadiusKm < 50 ? "\(Int(nearbyRadiusKm)) kilometers" : "All distances")")
+                            .accessibilityHint("Tap to change the search radius")
                         }
-                    )
+                        .padding(.horizontal)
+
+                        if filteredPublicGroups.isEmpty {
+                            Text("No public groups within \(Int(nearbyRadiusKm)) km")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                        } else {
+                            LazyVStack(spacing: 12) {
+                                ForEach(filteredPublicGroups) { group in
+                                    GroupRowButton(group: group, onTap: {
+                                        HapticManager.light()
+                                        selectedGroup = group
+                                    })
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
                 }
 
                 // Empty State
-                if joinedGroups.isEmpty && publicGroups.isEmpty {
+                if joinedGroups.isEmpty && filteredPublicGroups.isEmpty && publicGroups.isEmpty {
                     EmptyGroupsView()
                 }
 
@@ -104,6 +167,22 @@ struct ListTabView: View {
         return groups.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
 
+    private var favoriteGroups: [LocationGroup] {
+        let favoriteIds = Set(firestoreService.currentUser?.favoriteGroupIds ?? [])
+        return joinedGroups.filter { group in
+            guard let id = group.id else { return false }
+            return favoriteIds.contains(id)
+        }
+    }
+
+    private var nonFavoriteJoinedGroups: [LocationGroup] {
+        let favoriteIds = Set(firestoreService.currentUser?.favoriteGroupIds ?? [])
+        return joinedGroups.filter { group in
+            guard let id = group.id else { return true }
+            return !favoriteIds.contains(id)
+        }
+    }
+
     private var publicGroups: [LocationGroup] {
         let joined = Set(firestoreService.currentUser?.joinedGroupIds ?? [])
         let groups = firestoreService.publicGroups.filter { group in
@@ -114,6 +193,15 @@ struct ListTabView: View {
             return groups
         }
         return groups.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+    }
+
+    private var filteredPublicGroups: [LocationGroup] {
+        guard nearbyRadiusKm < 50 else { return publicGroups }
+        let radiusMeters = nearbyRadiusKm * 1000
+        return publicGroups.filter { group in
+            guard let distance = locationService.distanceToGroup(group) else { return true }
+            return distance <= radiusMeters
+        }
     }
 
     private func refreshData() async {
@@ -139,6 +227,7 @@ struct ListTabView: View {
 struct GroupSection: View {
     let title: String
     let groups: [LocationGroup]
+    var showFavoriteToggle: Bool = false
     let onGroupTap: (LocationGroup) -> Void
 
     var body: some View {
@@ -149,7 +238,7 @@ struct GroupSection: View {
 
             LazyVStack(spacing: 12) {
                 ForEach(groups) { group in
-                    GroupRowButton(group: group, onTap: {
+                    GroupRowButton(group: group, showFavoriteToggle: showFavoriteToggle, onTap: {
                         HapticManager.light()
                         onGroupTap(group)
                     })
@@ -164,11 +253,12 @@ struct GroupSection: View {
 
 struct GroupRowButton: View {
     let group: LocationGroup
+    var showFavoriteToggle: Bool = false
     let onTap: () -> Void
     @State private var isPressed = false
 
     var body: some View {
-        GroupRowView(group: group)
+        GroupRowView(group: group, showFavoriteToggle: showFavoriteToggle)
             .scaleEffect(isPressed ? 0.98 : 1.0)
             .animation(.easeInOut(duration: 0.1), value: isPressed)
             .onTapGesture {
@@ -184,6 +274,7 @@ struct GroupRowButton: View {
 
 struct GroupRowView: View {
     let group: LocationGroup
+    var showFavoriteToggle: Bool = false
     @ObservedObject private var locationService = LocationService.shared
     @ObservedObject private var firestoreService = FirestoreService.shared
     @ObservedObject private var presenceService = PresenceService.shared
@@ -196,8 +287,7 @@ struct GroupRowView: View {
                     .fill(isJoined ? Color.blue.opacity(0.15) : Color.gray.opacity(0.15))
                     .frame(width: 50, height: 50)
 
-                Text(group.displayEmoji)
-                    .font(.title2)
+                GroupIconView(icon: group.displayEmoji, size: 28)
             }
 
             // Info
@@ -211,6 +301,7 @@ struct GroupRowView: View {
                         Image(systemName: "lock.fill")
                             .font(.caption)
                             .foregroundColor(.secondary)
+                            .accessibilityLabel("Private group")
                     }
                 }
 
@@ -227,22 +318,49 @@ struct GroupRowView: View {
 
             Spacer()
 
+            // Favorite toggle
+            if showFavoriteToggle, isJoined {
+                Button {
+                    HapticManager.light()
+                    Task {
+                        if let groupId = group.id {
+                            await firestoreService.toggleFavoriteGroup(groupId: groupId)
+                        }
+                    }
+                } label: {
+                    Image(systemName: isFavorited ? "star.fill" : "star")
+                        .font(.body)
+                        .foregroundColor(isFavorited ? .yellow : .secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isFavorited ? "Remove from favorites" : "Add to favorites")
+            }
+
             // Chevron
             Image(systemName: "chevron.right")
                 .font(.caption)
                 .foregroundColor(.secondary)
+                .accessibilityHidden(true)
         }
         .padding()
         .background(
             RoundedRectangle(cornerRadius: 12)
                 .fill(Color(.systemBackground))
-                .shadow(color: .black.opacity(0.05), radius: 5, y: 2)
+                .shadow(color: .appShadow.opacity(0.5), radius: 5, y: 2)
         )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(group.name)\(!group.isPublic ? ", private group" : ""), \(presenceService.formatPresenceDisplay(for: group))\(distanceText.map { ", \($0)" } ?? "")")
+        .accessibilityHint("Tap to view group details")
     }
 
     private var isJoined: Bool {
         guard let groupId = group.id else { return false }
         return firestoreService.currentUser?.joinedGroupIds.contains(groupId) ?? false
+    }
+
+    private var isFavorited: Bool {
+        guard let groupId = group.id else { return false }
+        return firestoreService.isGroupFavorited(groupId: groupId)
     }
 
     private var distanceText: String? {
@@ -259,21 +377,11 @@ struct GroupRowView: View {
 
 struct EmptyGroupsView: View {
     var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "map")
-                .font(.system(size: 48))
-                .foregroundColor(.secondary)
-
-            Text("No Groups Yet")
-                .font(.headline)
-
-            Text("Create a group for your favorite spot or join a public group nearby.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-        }
-        .padding(.vertical, 48)
+        EmptyStateView(
+            icon: "map",
+            title: "No Groups Yet",
+            message: "Create a group for your favorite spot or join a public group nearby."
+        )
     }
 }
 

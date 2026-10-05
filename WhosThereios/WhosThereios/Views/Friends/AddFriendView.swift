@@ -14,7 +14,9 @@ struct AddFriendView: View {
 
     @State private var searchText = ""
     @State private var searchResults: [User] = []
+    @State private var suggestedUsers: [User] = []
     @State private var isSearching = false
+    @State private var isLoadingSuggestions = true
     @State private var errorMessage: String?
     @State private var successMessage: String?
     @State private var pendingRequestUserIds: Set<String> = []
@@ -22,23 +24,12 @@ struct AddFriendView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // Search instruction
-                VStack(spacing: 8) {
-                    Text("Add by Username")
-                        .font(.headline)
-
-                    Text("Search by username tag (e.g., Jake#1234)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                .padding()
-
                 // Search field
                 HStack {
                     Image(systemName: "magnifyingglass")
                         .foregroundColor(.secondary)
 
-                    TextField("Username#1234", text: $searchText)
+                    TextField("Search by username (e.g., Jake#1234)", text: $searchText)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .onSubmit {
@@ -56,9 +47,10 @@ struct AddFriendView: View {
                     }
                 }
                 .padding()
-                .background(Color(.systemGray6))
+                .background(Color(.secondarySystemBackground))
                 .cornerRadius(12)
                 .padding(.horizontal)
+                .padding(.top, 12)
 
                 // Messages
                 if let error = errorMessage {
@@ -75,31 +67,37 @@ struct AddFriendView: View {
                         .padding(.top, 8)
                 }
 
-                // Results
+                // Content
                 if isSearching {
                     Spacer()
                     ProgressView("Searching...")
                     Spacer()
-                } else if searchResults.isEmpty && !searchText.isEmpty {
-                    Spacer()
-                    ContentUnavailableView(
-                        "No Results",
-                        systemImage: "person.slash",
-                        description: Text("No users found matching \"\(searchText)\"")
-                    )
-                    Spacer()
-                } else {
-                    List(searchResults) { user in
-                        SearchResultRow(
-                            user: user,
-                            isPending: pendingRequestUserIds.contains(user.id ?? ""),
-                            isFriend: friendService.friends.contains { $0.id == user.id },
-                            onSendRequest: {
-                                await sendRequest(to: user)
-                            }
+                } else if !searchText.isEmpty {
+                    // Search results mode
+                    if searchResults.isEmpty {
+                        Spacer()
+                        ContentUnavailableView(
+                            "No Results",
+                            systemImage: "person.slash",
+                            description: Text("No users found matching \"\(searchText)\"")
                         )
+                        Spacer()
+                    } else {
+                        List(searchResults) { user in
+                            SearchResultRow(
+                                user: user,
+                                isPending: pendingRequestUserIds.contains(user.id ?? ""),
+                                isFriend: friendService.friends.contains { $0.id == user.id },
+                                onSendRequest: {
+                                    await sendRequest(to: user)
+                                }
+                            )
+                        }
+                        .listStyle(.plain)
                     }
-                    .listStyle(.plain)
+                } else {
+                    // Suggestions mode
+                    suggestionsSection
                 }
             }
             .navigationTitle("Add Friend")
@@ -119,7 +117,6 @@ struct AddFriendView: View {
                 }
             }
             .onChange(of: searchText) { _, newValue in
-                // Auto-search after a brief delay
                 Task {
                     try? await Task.sleep(for: .milliseconds(500))
                     if searchText == newValue && !newValue.isEmpty {
@@ -127,12 +124,67 @@ struct AddFriendView: View {
                     }
                 }
             }
-            .onAppear {
-                // Track which users have pending requests
+            .task {
                 pendingRequestUserIds = Set(friendService.sentRequests.map { $0.receiverId })
+                suggestedUsers = await friendService.fetchPeopleYouMayKnow()
+                isLoadingSuggestions = false
             }
         }
     }
+
+    // MARK: - Suggestions Section
+
+    @ViewBuilder
+    private var suggestionsSection: some View {
+        if isLoadingSuggestions {
+            Spacer()
+            ProgressView("Finding people you may know...")
+            Spacer()
+        } else if suggestedUsers.isEmpty {
+            Spacer()
+            VStack(spacing: 12) {
+                Image(systemName: "person.2.slash")
+                    .font(.system(size: 40))
+                    .foregroundColor(.secondary)
+                Text("No Suggestions Yet")
+                    .font(.headline)
+                Text("Join more groups to discover people you may know.")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .padding()
+            Spacer()
+        } else {
+            List {
+                Section {
+                    ForEach(suggestedUsers) { user in
+                        SuggestionRow(
+                            user: user,
+                            sharedGroups: friendService.sharedGroupCount(with: user.id ?? ""),
+                            isNearby: friendService.isUserNearby(user.id ?? ""),
+                            isPending: pendingRequestUserIds.contains(user.id ?? ""),
+                            onSendRequest: {
+                                await sendRequest(to: user)
+                            }
+                        )
+                    }
+                } header: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "person.2.fill")
+                        Text("People You May Know")
+                    }
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.primary)
+                    .textCase(nil)
+                }
+            }
+            .listStyle(.plain)
+        }
+    }
+
+    // MARK: - Search
 
     private func search() async {
         guard !searchText.isEmpty else { return }
@@ -141,7 +193,6 @@ struct AddFriendView: View {
         errorMessage = nil
         successMessage = nil
 
-        // Check if it's an exact tag search (contains #)
         if searchText.contains("#") {
             if let user = await firestoreService.searchUserByExactTag(searchText) {
                 searchResults = [user]
@@ -149,7 +200,6 @@ struct AddFriendView: View {
                 searchResults = []
             }
         } else {
-            // Prefix search
             searchResults = await firestoreService.searchUsersByName(searchText)
         }
 
@@ -174,6 +224,98 @@ struct AddFriendView: View {
     }
 }
 
+// MARK: - Suggestion Row
+
+private struct SuggestionRow: View {
+    let user: User
+    let sharedGroups: Int
+    let isNearby: Bool
+    let isPending: Bool
+    let onSendRequest: () async -> Void
+
+    @State private var isSending = false
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Avatar
+            ZStack {
+                Circle()
+                    .fill(Color.appBlue.opacity(0.15))
+                    .frame(width: 44, height: 44)
+
+                Text(user.profileEmoji ?? String(user.displayName.prefix(1).uppercased()))
+                    .font(user.profileEmoji != nil ? .title3 : .headline)
+            }
+
+            // Name + info
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(user.displayName)
+                        .font(.body)
+                        .fontWeight(.medium)
+
+                    if isNearby {
+                        HStack(spacing: 3) {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 6, height: 6)
+                            Text("Here now")
+                                .font(.caption2)
+                                .fontWeight(.medium)
+                        }
+                        .foregroundColor(.green)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.green.opacity(0.1))
+                        .cornerRadius(6)
+                    }
+                }
+
+                HStack(spacing: 4) {
+                    Image(systemName: "person.2")
+                        .font(.caption2)
+                    Text("\(sharedGroups) shared group\(sharedGroups == 1 ? "" : "s")")
+                        .font(.caption)
+                }
+                .foregroundColor(.secondary)
+            }
+
+            Spacer()
+
+            // Action
+            if isPending {
+                Label("Pending", systemImage: "clock")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            } else {
+                Button {
+                    Task {
+                        isSending = true
+                        await onSendRequest()
+                        isSending = false
+                    }
+                } label: {
+                    if isSending {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                    } else {
+                        Label("Add", systemImage: "person.badge.plus")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .buttonBorderShape(.capsule)
+                .controlSize(.small)
+                .disabled(isSending)
+            }
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(user.displayName), \(sharedGroups) shared groups\(isNearby ? ", nearby" : "")")
+    }
+}
+
 // MARK: - Search Result Row
 
 struct SearchResultRow: View {
@@ -191,9 +333,8 @@ struct SearchResultRow: View {
                 .fill(Color.gray.opacity(0.3))
                 .frame(width: 44, height: 44)
                 .overlay {
-                    Text(user.displayName.prefix(1).uppercased())
-                        .font(.headline)
-                        .foregroundColor(.primary)
+                    Text(user.profileEmoji ?? String(user.displayName.prefix(1).uppercased()))
+                        .font(user.profileEmoji != nil ? .title3 : .headline)
                 }
 
             // Name

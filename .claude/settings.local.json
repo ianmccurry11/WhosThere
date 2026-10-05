@@ -7,7 +7,31 @@
       "Bash(firebase firestore:rules:get:*)",
       "Bash(git init:*)",
       "Bash(git branch:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git rm:*)",
+      "Bash(git commit:*)",
+      "Bash(gh repo create:*)",
+      "Bash(git push:*)",
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(xargs:*)",
+      "Bash(find:*)",
+      "Bash(__NEW_LINE_0c0d47b86697b2d6__ echo \"=== 1. Deployment Targets ===\")",
+      "Bash(__NEW_LINE_0c0d47b86697b2d6__ echo \"\")",
+      "Bash(test:*)",
+      "Bash(__NEW_LINE_1c61c858edbf3069__ echo \"\")",
+      "Bash(__NEW_LINE_93bfe61b4adbc2ca__ echo \"\")",
+      "Bash(gh auth status:*)",
+      "Bash(git config:*)",
+      "Bash(gh repo list:*)",
+      "Bash(gh api:*)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(grep:*)",
+      "Bash(ruby -e:*)",
+      "Bash(npm run:*)",
+      "Bash(rm -rf /Users/ianmccurry/Library/Developer/Xcode/DerivedData/Unsaved_Xcode_Document_2-blmcqhnzlrqhvxbyiwrrcdmdjsgt)",
+      "Bash(rm -rf /Users/ianmccurry/Library/Developer/Xcode/DerivedData/ModuleCache.noindex)"
     ]
   }
 }

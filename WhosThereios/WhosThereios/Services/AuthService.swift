@@ -17,6 +17,7 @@ class AuthService: NSObject, ObservableObject {
     @Published var isAuthenticated = false
     @Published var isLoading = false
     @Published var errorMessage: String?
+    @Published var isNewUser = false
 
     private var authStateHandler: AuthStateDidChangeListenerHandle?
     private var currentNonce: String?
@@ -60,15 +61,14 @@ class AuthService: NSObject, ObservableObject {
             self.isAuthenticated = true
 
             // Create user document
-            let isNewUser: Bool
             if let userId = self.user?.uid {
-                isNewUser = await FirestoreService.shared.createUserIfNeeded(
+                self.isNewUser = await FirestoreService.shared.createUserIfNeeded(
                     userId: userId,
                     displayName: "Player \(String(userId.prefix(4)))",
                     email: nil
                 )
             } else {
-                isNewUser = false
+                self.isNewUser = false
             }
 
             analyticsService.trackSignInSuccess(method: "anonymous", isNewUser: isNewUser)
@@ -99,10 +99,52 @@ class AuthService: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Account Deletion
+
+    /// Deletes the current user's account and all associated data from Firestore and Firebase Auth.
+    /// Required by Apple App Store Guideline 5.1.1(v).
+    func deleteAccount() async -> Bool {
+        guard let user = Auth.auth().currentUser else {
+            errorMessage = "No user signed in"
+            return false
+        }
+
+        isLoading = true
+        errorMessage = nil
+
+        let userId = user.uid
+
+        do {
+            // 1. Delete user's Firestore data
+            await FirestoreService.shared.deleteAllUserData(userId: userId)
+
+            // 2. Clear FCM token
+            await NotificationService.shared.clearFCMToken()
+
+            // 3. Delete Firebase Auth account
+            try await user.delete()
+
+            // 4. Clear local state
+            self.user = nil
+            self.isAuthenticated = false
+            UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "")
+
+            analyticsService.trackSignOut()
+
+            isLoading = false
+            return true
+        } catch {
+            isLoading = false
+            errorMessage = "Failed to delete account: \(error.localizedDescription)"
+            analyticsService.trackError(errorType: "account_deletion_failed", context: "AuthService.deleteAccount", message: error.localizedDescription)
+            return false
+        }
+    }
+
     // MARK: - Sign in with Apple
 
     func startSignInWithAppleFlow() -> ASAuthorizationAppleIDRequest {
-        let nonce = randomNonceString()
+        let nonce = generateNonce()
         currentNonce = nonce
         let appleIDProvider = ASAuthorizationAppleIDProvider()
         let request = appleIDProvider.createRequest()
@@ -140,7 +182,7 @@ class AuthService: NSObject, ObservableObject {
             self.user = result.user
             self.isAuthenticated = true
 
-            // Extract display name
+            // Extract display name from Apple credential (only provided on first sign-in)
             var displayName = "User"
             if let fullName = appleIDCredential.fullName {
                 let givenName = fullName.givenName ?? ""
@@ -149,21 +191,26 @@ class AuthService: NSObject, ObservableObject {
                     displayName = "\(givenName) \(familyName)".trimmingCharacters(in: .whitespaces)
                 }
             }
+            // Fall back to email prefix if name not provided
             if displayName == "User", let email = appleIDCredential.email {
                 displayName = email.components(separatedBy: "@").first ?? "User"
             }
+            // Fall back to Firebase display name (persisted from first Apple sign-in)
             if displayName == "User" {
                 displayName = result.user.displayName ?? "User \(String(result.user.uid.prefix(4)))"
             }
 
             // Create user document
-            let isNewUser = await FirestoreService.shared.createUserIfNeeded(
+            let isNew = await FirestoreService.shared.createUserIfNeeded(
                 userId: result.user.uid,
                 displayName: displayName,
                 email: result.user.email ?? appleIDCredential.email
             )
 
-            analyticsService.trackSignInSuccess(method: "apple", isNewUser: isNewUser)
+            // Prompt new users to set a preferred display name (username).
+            self.isNewUser = isNew
+
+            analyticsService.trackSignInSuccess(method: "apple", isNewUser: isNew)
         } catch {
             let duration = Date().timeIntervalSince(startTime) * 1000
             networkInspector.logAuthOperation(method: "signIn", durationMs: duration, success: false, error: error)
@@ -176,12 +223,17 @@ class AuthService: NSObject, ObservableObject {
 
     // MARK: - Nonce Generation
 
-    private func randomNonceString(length: Int = 32) -> String {
+    private func generateNonce(length: Int = 32) -> String {
         precondition(length > 0)
         var randomBytes = [UInt8](repeating: 0, count: length)
         let errorCode = SecRandomCopyBytes(kSecRandomDefault, randomBytes.count, &randomBytes)
+
         if errorCode != errSecSuccess {
-            fatalError("Unable to generate nonce. SecRandomCopyBytes failed with OSStatus \(errorCode)")
+            // Fallback: use UUID-based nonce instead of crashing
+            errorMessage = "Secure random generation failed. Please try again."
+            AppLogger.debug("SecRandomCopyBytes failed with OSStatus \(errorCode), using UUID fallback")
+            let uuid = UUID().uuidString + UUID().uuidString
+            return String(uuid.replacingOccurrences(of: "-", with: "").prefix(length))
         }
 
         let charset: [Character] = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVXYZabcdefghijklmnopqrstuvwxyz-._")

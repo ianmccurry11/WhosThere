@@ -222,12 +222,3 @@ extension WatchViewModel: CLLocationManagerDelegate {
     }
 }
 
-// MARK: - WKInterfaceDevice Extension
-
-import WatchKit
-
-extension WKInterfaceDevice {
-    func play(_ type: WKHapticType) {
-        WKInterfaceDevice.current().play(type)
-    }
-}

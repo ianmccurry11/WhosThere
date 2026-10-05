@@ -15,6 +15,7 @@ struct GroupChatView: View {
     @StateObject private var chatService: ChatService
     @State private var messageText = ""
     @State private var showError = false
+    @State private var reportingMessage: Message?
     @FocusState private var isInputFocused: Bool
 
     private let currentUserId = Auth.auth().currentUser?.uid
@@ -39,7 +40,8 @@ struct GroupChatView: View {
                             ForEach(chatService.messages) { message in
                                 MessageBubble(
                                     message: message,
-                                    isOwnMessage: message.senderId == currentUserId
+                                    isOwnMessage: message.senderId == currentUserId,
+                                    onReport: { reportingMessage = message }
                                 )
                                 .id(message.id)
                             }
@@ -82,6 +84,16 @@ struct GroupChatView: View {
         .onChange(of: chatService.error) { _, newValue in
             showError = newValue != nil
         }
+        .sheet(item: $reportingMessage) { message in
+            ReportUserView(
+                reportedUserId: message.senderId,
+                reportedDisplayName: message.senderName,
+                context: .chat,
+                groupId: group.id,
+                messageId: message.id,
+                messageText: message.text
+            )
+        }
     }
 
     private func sendMessage() {
@@ -102,20 +114,11 @@ struct GroupChatView: View {
 
 private struct ChatEmptyStateView: View {
     var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "bubble.left.and.bubble.right")
-                .font(.system(size: 48))
-                .foregroundColor(.secondary)
-
-            Text("No messages yet")
-                .font(.headline)
-                .foregroundColor(.secondary)
-
-            Text("Be the first to say something!")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-        }
-        .padding(.vertical, 60)
+        EmptyStateView(
+            icon: "bubble.left.and.bubble.right",
+            title: "No Messages Yet",
+            message: "Be the first to say something!"
+        )
     }
 }
 
@@ -124,6 +127,7 @@ private struct ChatEmptyStateView: View {
 private struct MessageBubble: View {
     let message: Message
     let isOwnMessage: Bool
+    var onReport: (() -> Void)? = nil
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 8) {
@@ -144,13 +148,24 @@ private struct MessageBubble: View {
                     .padding(.vertical, 8)
                     .background(
                         RoundedRectangle(cornerRadius: 16)
-                            .fill(isOwnMessage ? Color.blue : Color(.systemGray5))
+                            .fill(isOwnMessage ? Color.appBlue : Color(.secondarySystemBackground))
                     )
                     .foregroundColor(isOwnMessage ? .white : .primary)
 
                 Text(formatTime(message.createdAt))
                     .font(.caption2)
                     .foregroundColor(.secondary)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(isOwnMessage ? "You" : message.senderName): \(message.text), \(formatTime(message.createdAt))")
+            .contextMenu {
+                if !isOwnMessage {
+                    Button(role: .destructive) {
+                        onReport?()
+                    } label: {
+                        Label("Report Message", systemImage: "flag")
+                    }
+                }
             }
 
             if !isOwnMessage {
@@ -198,9 +213,10 @@ private struct MessageInputBar: View {
             Button(action: onSend) {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 32))
-                    .foregroundColor(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .gray : .blue)
+                    .foregroundColor(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .gray : .appBlue)
             }
             .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .accessibilityLabel("Send message")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -255,11 +271,13 @@ struct ChatPreviewRow: View {
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
                         .background(Capsule().fill(Color.blue))
+                        .accessibilityLabel("\(unreadCount) unread")
                 }
 
                 Image(systemName: "chevron.right")
                     .font(.caption)
                     .foregroundColor(.secondary)
+                    .accessibilityHidden(true)
             }
             .padding(.vertical, 4)
         }
@@ -285,7 +303,7 @@ struct ChatPreviewRow: View {
                 lastMessage = try? doc.data(as: Message.self)
             }
         } catch {
-            print("Error loading last message: \(error)")
+            AppLogger.debug("Error loading last message: \(error)")
         }
     }
 }

@@ -9,9 +9,14 @@ import Foundation
 import CoreLocation
 import Combine
 
+/// Wraps CLLocationManager for location updates and geofence monitoring.
+/// iOS limits monitored regions to 20 -- Android allows up to 100.
+/// Geofence enter/exit events are forwarded via onEnterRegion/onExitRegion callbacks.
 @MainActor
 class LocationService: NSObject, ObservableObject {
     static let shared = LocationService()
+
+    // MARK: - Public State
 
     @Published var currentLocation: CLLocation?
     @Published var authorizationStatus: CLAuthorizationStatus = .notDetermined
@@ -30,6 +35,8 @@ class LocationService: NSObject, ObservableObject {
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
         authorizationStatus = locationManager.authorizationStatus
     }
+
+    // MARK: - Permission Handling
 
     func requestAuthorization() {
         // iOS requires requesting "When In Use" first, then "Always" after user grants it
@@ -55,6 +62,8 @@ class LocationService: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Location Updates
+
     func startUpdatingLocation() {
         locationManager.startUpdatingLocation()
     }
@@ -63,11 +72,13 @@ class LocationService: NSObject, ObservableObject {
         locationManager.stopUpdatingLocation()
     }
 
+    // MARK: - Geofence Registration (max 20 regions on iOS)
+
     func startMonitoringGroups(_ groups: [LocationGroup]) {
         // Geofence monitoring requires "Always" authorization
         // Without it, we skip region monitoring (users will need to check in manually)
         guard authorizationStatus == .authorizedAlways else {
-            print("Skipping geofence monitoring - requires 'Always' location permission")
+            AppLogger.debug("Skipping geofence monitoring - requires 'Always' location permission")
             isMonitoring = false
             return
         }
@@ -134,12 +145,14 @@ class LocationService: NSObject, ObservableObject {
         }
 
         // Calculate new center and radius from coordinates
-        guard !coordinates.isEmpty else { return }
+        guard !coordinates.isEmpty,
+              let minLat = coordinates.map({ $0.latitude }).min(),
+              let maxLat = coordinates.map({ $0.latitude }).max(),
+              let minLon = coordinates.map({ $0.longitude }).min(),
+              let maxLon = coordinates.map({ $0.longitude }).max() else { return }
 
-        let latitudes = coordinates.map { $0.latitude }
-        let longitudes = coordinates.map { $0.longitude }
-        let centerLat = (latitudes.min()! + latitudes.max()!) / 2
-        let centerLon = (longitudes.min()! + longitudes.max()!) / 2
+        let centerLat = (minLat + maxLat) / 2
+        let centerLon = (minLon + maxLon) / 2
         let center = CLLocationCoordinate2D(latitude: centerLat, longitude: centerLon)
 
         // Calculate radius as max distance from center to any boundary point
@@ -171,8 +184,10 @@ class LocationService: NSObject, ObservableObject {
             monitoredGroups[groupId] = cachedGroup
         }
 
-        print("Updated geofence for group \(groupId) - center: \(center), radius: \(radius)m")
+        AppLogger.debug("Updated geofence for group \(groupId) - center: \(center), radius: \(radius)m")
     }
+
+    // MARK: - Point-in-Polygon Detection
 
     func checkPresenceInGroups(_ groups: [LocationGroup]) -> [String: Bool] {
         guard let currentLoc = currentLocation else { return [:] }
@@ -216,6 +231,8 @@ class LocationService: NSObject, ObservableObject {
         return currentLoc.distance(from: groupLocation)
     }
 }
+
+// MARK: - CLLocationManagerDelegate
 
 extension LocationService: CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
@@ -265,7 +282,8 @@ extension LocationService: CLLocationManagerDelegate {
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor in
-            self.errorMessage = error.localizedDescription
+            AppLogger.debug("Location error: \(error.localizedDescription)")
+            self.errorMessage = "Unable to determine your location. Please check your settings."
         }
     }
 }

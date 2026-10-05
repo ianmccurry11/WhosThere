@@ -1,6 +1,6 @@
 # Who's There
 
-A location-based presence app for iOS and Apple Watch that helps users see who's at their favorite spots.
+A location-based presence app for iOS and Apple Watch that helps users see who's at their favorite spots. An Android version (Kotlin / Jetpack Compose) is in development — see [`docs/ANDROID_PLATFORM_MAP.md`](docs/ANDROID_PLATFORM_MAP.md) and the migration plan.
 
 ## Overview
 
@@ -19,32 +19,56 @@ Who's There allows users to create and join location-based groups (basketball co
 
 ## Requirements
 
+### iOS
 - iOS 17.0+
 - watchOS 10.0+
 - Xcode 15.0+
 - Firebase account
 - Apple Developer account (for distribution)
 
+### Android (in development)
+- Android 8.0+ (API 26+)
+- Android Studio
+- Firebase account (same project: `whostherefb`)
+- Google Play Developer account (for distribution)
+- Google Maps API key
+
 ## Installation
 
+### iOS
 1. Clone the repository
-2. Open `WhosThereios.xcodeproj` in Xcode
+2. Open `WhosThereios/WhosThereios.xcodeproj` in Xcode
 3. Add your `GoogleService-Info.plist` from Firebase Console
+4. Build and run
+
+### Android
+1. Open `WhosThereAndroid/` in Android Studio
+2. Add your `google-services.json` from Firebase Console (same Firebase project, Android app entry)
+3. Add your Google Maps API key to `local.properties`: `MAPS_API_KEY=your_key_here`
 4. Build and run
 
 ## Project Structure
 
 ```
-WhosThereios/
-├── WhosThereios/              # Main iOS app
-│   ├── Models/                # Data models
-│   ├── Services/              # Business logic & Firebase
-│   ├── Views/                 # SwiftUI views
-│   ├── Utilities/             # Helpers & error handling
-│   └── Assets.xcassets/       # Images & colors
-├── WhosThereWatch Watch App/  # Apple Watch app
-├── WhosThereiosTests/         # Unit tests
-└── firestore.rules            # Firebase security rules
+WhosThere/                         # Repo root
+├── WhosThereios/                  # iOS Xcode project
+│   ├── WhosThereios/              # Main iOS app
+│   │   ├── Models/                # Data models (Codable)
+│   │   ├── Services/              # Business logic & Firebase
+│   │   ├── Views/                 # SwiftUI views
+│   │   └── Utilities/             # Helpers & error handling
+│   └── WhosThereWatch Watch App/  # Apple Watch app
+├── WhosThereAndroid/              # Android project (in development)
+│   └── app/src/main/
+│       ├── data/model/            # Kotlin data classes (mirrors iOS Models/)
+│       ├── data/repository/       # Firebase operations (mirrors iOS Services/)
+│       ├── service/               # Location, Presence, Chat
+│       └── ui/                    # Jetpack Compose screens
+├── firestore.rules                # Firebase security rules (shared)
+├── FIRESTORE_SCHEMA.md            # Data contract for both platforms
+└── docs/
+    ├── ANDROID_PLATFORM_MAP.md    # iOS → Android mapping reference
+    └── ...                        # Other architecture docs
 ```
 
 ## Architecture

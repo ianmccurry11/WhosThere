@@ -30,12 +30,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         NotificationService.shared.setAPNsToken(deviceToken)
 
         let tokenString = deviceToken.map { String(format: "%02.2hhx", $0) }.joined()
-        print("APNs token received: \(tokenString)")
+        AppLogger.debug("APNs token received: \(tokenString)")
     }
 
     func application(_ application: UIApplication,
                      didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        print("Failed to register for remote notifications: \(error)")
+        AppLogger.debug("Failed to register for remote notifications: \(error)")
     }
 
     // Handle notification when app is in background
@@ -54,6 +54,9 @@ struct WhosThereiosApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .onOpenURL { url in
+                    DeepLinkService.shared.handleURL(url)
+                }
         }
     }
 }
