@@ -303,6 +303,21 @@ service cloud.firestore {
     }
 
     // ============================================
+    // PRESENCE RE-CHECK REQUESTS
+    // ============================================
+    // Opening a group writes here; the onPresenceRecheckRequest function
+    // checks membership and rate-limits the silent pushes it sends.
+
+    match /presenceRecheckRequests/{groupId} {
+      allow read: if false;
+      allow create, update: if isAuthenticated()
+        && request.resource.data.keys().hasOnly(['requestedBy', 'requestedAt'])
+        && request.resource.data.requestedBy == userId()
+        && request.resource.data.requestedAt == request.time;
+      allow delete: if false;
+    }
+
+    // ============================================
     // COUNTERS COLLECTION (for sequential IDs)
     // ============================================
 

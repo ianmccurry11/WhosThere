@@ -322,3 +322,101 @@ final class PresenceActiveRuleTests: XCTestCase {
         XCTAssertFalse(presence(updatedAgo: Presence.maxAge + 1).isActive(at: now))
     }
 }
+
+final class PresenceFadingTests: XCTestCase {
+
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func presence(updatedAgo: TimeInterval, isManual: Bool = false) -> Presence {
+        Presence(
+            userId: "user1",
+            groupId: "group1",
+            isPresent: true,
+            isManual: isManual,
+            lastUpdated: now.addingTimeInterval(-updatedAgo),
+            expiresAt: now.addingTimeInterval(3600)
+        )
+    }
+
+    func testRecentlyConfirmedIsNotFading() {
+        let fresh = presence(updatedAgo: 10 * 60)
+        XCTAssertFalse(fresh.isFading(at: now))
+        XCTAssertNil(fresh.confirmationLabel(at: now))
+    }
+
+    func testQuietAutomaticCheckInFadesWithMinutesLabel() {
+        let quiet = presence(updatedAgo: 45 * 60)
+        XCTAssertTrue(quiet.isFading(at: now))
+        XCTAssertEqual(quiet.confirmationLabel(at: now), "confirmed 45m ago")
+    }
+
+    func testOldAutomaticCheckInShowsHoursLabel() {
+        XCTAssertEqual(presence(updatedAgo: 2 * 3600 + 600).confirmationLabel(at: now), "confirmed 2h ago")
+    }
+
+    func testManualCheckInNeverFades() {
+        XCTAssertFalse(presence(updatedAgo: 2 * 3600, isManual: true).isFading(at: now))
+    }
+}
+
+final class GroupBoundaryDistanceTests: XCTestCase {
+
+    /// Roughly a 100m x 100m square
+    private let group = LocationGroup(
+        id: "group1",
+        name: "Test",
+        isPublic: false,
+        ownerId: "owner",
+        boundary: [
+            Coordinate(latitude: 34.0000, longitude: -119.0000),
+            Coordinate(latitude: 34.0009, longitude: -119.0000),
+            Coordinate(latitude: 34.0009, longitude: -118.9989),
+            Coordinate(latitude: 34.0000, longitude: -118.9989)
+        ]
+    )
+
+    private func location(latitude: Double, longitude: Double, accuracy: Double) -> CLLocation {
+        CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: latitude, longitude: longitude),
+            altitude: 0,
+            horizontalAccuracy: accuracy,
+            verticalAccuracy: -1,
+            timestamp: Date()
+        )
+    }
+
+    func testInsideIsZeroDistance() {
+        let inside = CLLocationCoordinate2D(latitude: 34.0004, longitude: -118.9995)
+        XCTAssertEqual(group.distanceToBoundary(from: inside), 0)
+    }
+
+    func testDistanceOutsideMatchesCoreLocation() {
+        // ~50m north of the top edge
+        let outside = CLLocationCoordinate2D(latitude: 34.00135, longitude: -118.9995)
+        let edge = CLLocation(latitude: 34.0009, longitude: -118.9995)
+        let expected = CLLocation(latitude: outside.latitude, longitude: outside.longitude).distance(from: edge)
+        XCTAssertEqual(group.distanceToBoundary(from: outside), expected, accuracy: 1)
+    }
+
+    func testFixJustOutsideCountsWithinMargin() {
+        // ~20m outside the top edge with a good fix: inside the 30m margin
+        let fix = location(latitude: 34.00108, longitude: -118.9995, accuracy: 10)
+        XCTAssertEqual(group.isAt(fix), true)
+    }
+
+    func testFixFarOutsideDoesNotCount() {
+        // ~200m away
+        let fix = location(latitude: 34.0027, longitude: -118.9995, accuracy: 10)
+        XCTAssertEqual(group.isAt(fix), false)
+    }
+
+    func testMarginGrowsWithReportedAccuracy() {
+        // ~50m outside: too far for the 30m margin, fine with a 65m indoor fix
+        XCTAssertEqual(group.isAt(location(latitude: 34.00135, longitude: -118.9995, accuracy: 10)), false)
+        XCTAssertEqual(group.isAt(location(latitude: 34.00135, longitude: -118.9995, accuracy: 65)), true)
+    }
+
+    func testInaccurateFixIsInconclusive() {
+        XCTAssertNil(group.isAt(location(latitude: 34.0004, longitude: -118.9995, accuracy: 500)))
+    }
+}

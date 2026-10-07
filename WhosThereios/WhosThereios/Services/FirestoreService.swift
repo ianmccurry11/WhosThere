@@ -847,7 +847,19 @@ class FirestoreService: ObservableObject {
 
     // MARK: - Presence Operations (presence/{groupId}/members collection)
 
-    func updatePresence(groupId: String, isPresent: Bool, isManual: Bool, expiresAt: Date? = nil) async {
+    /// Writes the current user's presence for a group.
+    /// - Parameters:
+    ///   - source: what caused the write ("manual", "geofence", "recheck"…), for diagnostics
+    ///   - waitForServer: wait (up to 10s) for Firestore to accept the write. Use from
+    ///     background wakes, where iOS may suspend the app before a queued write is sent.
+    func updatePresence(
+        groupId: String,
+        isPresent: Bool,
+        isManual: Bool,
+        expiresAt: Date? = nil,
+        source: String? = nil,
+        waitForServer: Bool = false
+    ) async {
         guard let userId = Auth.auth().currentUser?.uid else { return }
 
         // Use currentUser if available, then UserDefaults cache, then Firebase Auth profile.
@@ -877,15 +889,72 @@ class FirestoreService: ObservableObject {
             isManual: isManual,
             lastUpdated: Date(),
             expiresAt: isPresent ? expiresAt : nil,  // Only set expiration when checking in
+            source: source ?? (isManual ? "manual" : "auto"),
             displayName: finalDisplayName,
             level: level
         )
 
+        let reference = db.collection("presence").document(groupId)
+            .collection("members").document(userId)
         do {
-            try db.collection("presence").document(groupId)
-                .collection("members").document(userId).setData(from: presence)
+            if waitForServer {
+                try await setDataAwaitingServer(presence, at: reference, timeout: 10)
+            } else {
+                try reference.setData(from: presence)
+            }
         } catch {
             AppLogger.debug("Error updating presence: \(error)")
+        }
+    }
+
+    /// Sets a document and waits for the server to acknowledge it, giving up
+    /// after `timeout` seconds (the write stays queued and is retried later).
+    private func setDataAwaitingServer(
+        _ presence: Presence,
+        at reference: DocumentReference,
+        timeout: TimeInterval
+    ) async throws {
+        let gate = ResumeOnceGate()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            do {
+                try reference.setData(from: presence) { error in
+                    gate.resume(continuation, throwing: error)
+                }
+            } catch {
+                gate.resume(continuation, throwing: error)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                gate.resume(continuation, throwing: nil)
+            }
+        }
+    }
+
+    /// Reads the current user's own presence doc for a group directly, for
+    /// background wakes where no listeners are running yet.
+    func fetchOwnPresence(groupId: String) async -> Presence? {
+        guard let userId = Auth.auth().currentUser?.uid else { return nil }
+        do {
+            let document = try await db.collection("presence").document(groupId)
+                .collection("members").document(userId).getDocument()
+            return document.exists ? try document.data(as: Presence.self) : nil
+        } catch {
+            AppLogger.debug("Error fetching own presence for \(groupId): \(error)")
+            return nil
+        }
+    }
+
+    /// Asks the server to silently ping members whose phones haven't confirmed
+    /// they're still at this group recently (see onPresenceRecheckRequest).
+    func requestPresenceRecheck(groupId: String) async {
+        guard let userId = Auth.auth().currentUser?.uid else { return }
+        do {
+            try await db.collection("presenceRecheckRequests").document(groupId).setData([
+                "requestedBy": userId,
+                "requestedAt": FieldValue.serverTimestamp()
+            ])
+        } catch {
+            AppLogger.debug("Error requesting presence re-check for \(groupId): \(error)")
         }
     }
 
@@ -1229,5 +1298,24 @@ class FirestoreService: ObservableObject {
         }
 
         return allUsers
+    }
+}
+
+/// Resumes a continuation exactly once, whichever caller gets there first
+/// (e.g. a Firestore server ack racing a timeout).
+private final class ResumeOnceGate: @unchecked Sendable {
+    private let lock = NSLock()
+    nonisolated(unsafe) private var hasResumed = false
+
+    nonisolated func resume(_ continuation: CheckedContinuation<Void, Error>, throwing error: Error?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !hasResumed else { return }
+        hasResumed = true
+        if let error {
+            continuation.resume(throwing: error)
+        } else {
+            continuation.resume()
+        }
     }
 }

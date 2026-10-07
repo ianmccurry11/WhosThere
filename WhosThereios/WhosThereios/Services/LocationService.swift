@@ -8,6 +8,7 @@
 import Foundation
 import CoreLocation
 import Combine
+import UIKit
 
 /// Wraps CLLocationManager for location updates and geofence monitoring.
 /// iOS limits monitored regions to 20 -- Android allows up to 100.
@@ -28,6 +29,12 @@ class LocationService: NSObject, ObservableObject {
 
     var onEnterRegion: ((String) -> Void)?
     var onExitRegion: ((String) -> Void)?
+    /// iOS woke the app in the background with new location info
+    /// (significant move or a visit). The argument names the trigger.
+    var onBackgroundWake: ((String) -> Void)?
+
+    /// Callers waiting on `requestFreshLocation`
+    private var pendingLocationRequests: [UUID: CheckedContinuation<CLLocation?, Never>] = [:]
 
     override init() {
         super.init()
@@ -70,6 +77,56 @@ class LocationService: NSObject, ObservableObject {
 
     func stopUpdatingLocation() {
         locationManager.stopUpdatingLocation()
+    }
+
+    /// Returns a recent, usable location fix: the current one if it's fresh
+    /// enough, otherwise asks iOS for a new one and waits up to `timeout`.
+    /// Works from background wakes when the user granted "Always".
+    func requestFreshLocation(maxAge: TimeInterval = 60, timeout: TimeInterval = 15) async -> CLLocation? {
+        if let currentLocation,
+           -currentLocation.timestamp.timeIntervalSinceNow <= maxAge,
+           currentLocation.horizontalAccuracy >= 0,
+           currentLocation.horizontalAccuracy <= PresencePolicy.maxUsableAccuracy {
+            return currentLocation
+        }
+
+        let requestId = UUID()
+        return await withCheckedContinuation { continuation in
+            pendingLocationRequests[requestId] = continuation
+            locationManager.requestLocation()
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                // Timed out: hand back whatever we have
+                self?.resolveLocationRequest(requestId, with: self?.currentLocation)
+            }
+        }
+    }
+
+    private func resolveLocationRequest(_ requestId: UUID, with location: CLLocation?) {
+        guard let continuation = pendingLocationRequests.removeValue(forKey: requestId) else { return }
+        continuation.resume(returning: location)
+    }
+
+    private func resolveAllLocationRequests(with location: CLLocation?) {
+        for requestId in Array(pendingLocationRequests.keys) {
+            resolveLocationRequest(requestId, with: location)
+        }
+    }
+
+    // MARK: - Background Wake-ups
+
+    /// Low-power triggers that let iOS wake (or relaunch) the app so it can
+    /// re-confirm check-ins: moves of ~500m and arrivals/departures at places.
+    /// Requires "Always" permission.
+    func startBackgroundWakeups() {
+        guard authorizationStatus == .authorizedAlways else { return }
+        locationManager.startMonitoringSignificantLocationChanges()
+        locationManager.startMonitoringVisits()
+    }
+
+    func stopBackgroundWakeups() {
+        locationManager.stopMonitoringSignificantLocationChanges()
+        locationManager.stopMonitoringVisits()
     }
 
     // MARK: - Geofence Registration (max 20 regions on iOS)
@@ -239,6 +296,16 @@ extension LocationService: CLLocationManagerDelegate {
         guard let location = locations.last else { return }
         Task { @MainActor in
             self.currentLocation = location
+            self.resolveAllLocationRequests(with: location)
+            if UIApplication.shared.applicationState == .background {
+                self.onBackgroundWake?("location")
+            }
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didVisit visit: CLVisit) {
+        Task { @MainActor in
+            self.onBackgroundWake?("visit")
         }
     }
 
@@ -265,6 +332,7 @@ extension LocationService: CLLocationManagerDelegate {
             switch manager.authorizationStatus {
             case .authorizedAlways:
                 self.startUpdatingLocation()
+                self.startBackgroundWakeups()
             case .authorizedWhenInUse:
                 self.startUpdatingLocation()
                 // Optionally request upgrade to Always (user can decline)
@@ -283,6 +351,7 @@ extension LocationService: CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor in
             AppLogger.debug("Location error: \(error.localizedDescription)")
+            self.resolveAllLocationRequests(with: nil)
             self.errorMessage = "Unable to determine your location. Please check your settings."
         }
     }

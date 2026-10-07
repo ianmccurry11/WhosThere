@@ -8,7 +8,9 @@
 import Foundation
 import Combine
 import CoreLocation
+import FirebaseAuth
 import FirebaseFirestore
+import UIKit
 
 /// Manages user presence (check-in/out) across all joined groups.
 /// Handles manual check-ins, geofence-triggered transitions, auto-checkout timers,
@@ -50,6 +52,12 @@ class PresenceService: ObservableObject {
     /// Re-applies the freshness rule so lapsed check-ins drop off without a new snapshot
     private var expiryTickTask: Task<Void, Never>?
     private let expiryTickInterval: TimeInterval = 30
+    /// Last time `confirmPresence` ran, to throttle background wakes
+    private var lastConfirmAt: Date?
+    /// Last time this device asked the server to re-check each group
+    private var lastRecheckRequestAt: [String: Date] = [:]
+    /// Matches ON_DEMAND_RECHECK_AFTER_MS in the Cloud Function
+    private let onDemandRecheckAfter: TimeInterval = 10 * 60
     private var lastAutoUpdate: [String: Date] = [:]
     private let updateThrottle: TimeInterval = 30 // Minimum seconds between auto-updates
     private var checkOutTimerTasks: [String: Task<Void, Never>] = [:]
@@ -78,6 +86,17 @@ class PresenceService: ObservableObject {
         firestoreService.currentUser?.autoCheckOutMinutes ?? 60
     }
 
+    /// When a new or re-confirmed automatic check-in should expire.
+    /// "Always" users get re-confirmed by background wakes, so it lasts
+    /// `PresencePolicy.autoExpiry`; "When In Use" users can't be confirmed in
+    /// the background, so it falls back to their auto check-out setting.
+    private var autoPresenceExpiry: Date {
+        let duration = hasAlwaysLocationPermission
+            ? PresencePolicy.autoExpiry
+            : TimeInterval(autoCheckOutMinutes * 60)
+        return Date().addingTimeInterval(duration)
+    }
+
     private func setupLocationCallbacks() {
         // Handle entering a region
         locationService.onEnterRegion = { [weak self] groupId in
@@ -90,6 +109,13 @@ class PresenceService: ObservableObject {
         locationService.onExitRegion = { [weak self] groupId in
             Task { @MainActor in
                 await self?.handleRegionExit(groupId: groupId)
+            }
+        }
+
+        // Significant moves and visits: re-confirm we're still where we said
+        locationService.onBackgroundWake = { [weak self] trigger in
+            Task { @MainActor in
+                await self?.confirmPresence(reason: trigger)
             }
         }
     }
@@ -233,7 +259,7 @@ class PresenceService: ObservableObject {
         checkOutTimerTasks[groupId]?.cancel()
         checkOutTimerTasks.removeValue(forKey: groupId)
         persistTimers()
-        await firestoreService.updatePresence(groupId: groupId, isPresent: false, isManual: false)
+        await firestoreService.updatePresence(groupId: groupId, isPresent: false, isManual: false, source: "auto_checkout_\(reason)")
         await refreshPresence(groupId: groupId)
 
         // Track analytics
@@ -316,6 +342,9 @@ class PresenceService: ObservableObject {
 
         // Also check stale presences on foreground return
         await checkAndClearStalePresences()
+
+        // Opening the app is a good moment to re-confirm automatic check-ins
+        await confirmPresence(reason: "foreground")
     }
 
     // MARK: - Heartbeat / Periodic Refresh
@@ -339,38 +368,121 @@ class PresenceService: ObservableObject {
         heartbeatTask = nil
     }
 
-    /// Refreshes `lastUpdated` for all groups where the current user is checked in.
-    /// This keeps the presence alive while the user has the app open.
-    /// For geofence-based presences, also extends `expiresAt`.
-    /// For manual check-ins, preserves the original expiration so the auto-checkout timer fires on schedule.
+    /// Keeps the user's check-ins alive while the app is open.
+    /// Manual check-ins just refresh `lastUpdated` and keep their original
+    /// expiry so the auto-checkout timer fires on schedule. Automatic ones are
+    /// only extended if a location fix says the user is still there.
     private func refreshActivePresences() async {
         guard let userId = firestoreService.currentUser?.id else { return }
 
-        for (groupId, summary) in presenceByGroup {
-            // Only refresh groups where the current user is actually present
+        for (groupId, summary) in presenceByGroup where manualOverrides[groupId] == true {
             guard summary.presentMembers.contains(where: { $0.userId == userId }) else { continue }
-
-            let isManual = manualOverrides[groupId] == true
-
-            if isManual {
-                // Manual check-in: only refresh lastUpdated, keep existing expiresAt
-                // so the auto-checkout timer fires at the original time
-                let existingExpiresAt = autoCheckOutTimers[groupId]
-                await firestoreService.updatePresence(groupId: groupId, isPresent: true, isManual: true, expiresAt: existingExpiresAt)
-                // Do NOT reset the local timer — let it expire on its original schedule
-            } else {
-                // Geofence-based presence: extend expiresAt since user is physically there
-                let newExpiresAt = Date().addingTimeInterval(TimeInterval(autoCheckOutMinutes * 60))
-                await firestoreService.updatePresence(groupId: groupId, isPresent: true, isManual: false, expiresAt: newExpiresAt)
-
-                // Reset the local timer for "When In Use" safety-net timers
-                if autoCheckOutTimers[groupId] != nil {
-                    startAutoCheckOutTimer(groupId: groupId)
-                }
-            }
-
-            AppLogger.debug("[PresenceService] Heartbeat refreshed presence for group \(groupId)")
+            let existingExpiresAt = autoCheckOutTimers[groupId]
+            await firestoreService.updatePresence(groupId: groupId, isPresent: true, isManual: true, expiresAt: existingExpiresAt)
+            AppLogger.debug("[PresenceService] Heartbeat refreshed manual presence for group \(groupId)")
         }
+
+        await confirmPresence(reason: "heartbeat", force: true)
+    }
+
+    // MARK: - Re-confirming Automatic Check-ins
+
+    /// Re-checks the user's location against every group they're automatically
+    /// checked in to, and pushes each check-in's expiry forward if they're still
+    /// there. Runs on every wake: silent re-check pushes from the server,
+    /// significant moves, visits, opening the app, and the foreground heartbeat.
+    ///
+    /// This never checks anyone out. A check-in that can't be confirmed shows as
+    /// "confirmed 1h ago", then expires on its own.
+    func confirmPresence(reason: String, force: Bool = false) async {
+        if !force, let lastConfirmAt,
+           Date().timeIntervalSince(lastConfirmAt) < PresencePolicy.minConfirmInterval {
+            return
+        }
+        lastConfirmAt = Date()
+
+        // Ask iOS for extra time: in the background we may only get a few seconds
+        let backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "ConfirmPresence")
+        defer {
+            if backgroundTask != .invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTask)
+            }
+        }
+
+        // Relaunched in the background: nothing has been loaded yet
+        if firestoreService.joinedGroups.isEmpty {
+            await firestoreService.fetchJoinedGroups()
+        }
+
+        var checkedInGroups: [LocationGroup] = []
+        for group in firestoreService.joinedGroups {
+            guard let groupId = group.id, manualOverrides[groupId] != true else { continue }
+            if let own = await ownPresence(in: groupId), own.isActive(), !own.isManual {
+                checkedInGroups.append(group)
+            }
+        }
+        guard !checkedInGroups.isEmpty else { return }
+
+        guard let location = await locationService.requestFreshLocation(timeout: 10) else {
+            AppLogger.debug("[PresenceService] confirm(\(reason)): no usable location fix")
+            return
+        }
+
+        for group in checkedInGroups where group.isAt(location) == true {
+            guard let groupId = group.id else { continue }
+            await firestoreService.updatePresence(
+                groupId: groupId,
+                isPresent: true,
+                isManual: false,
+                expiresAt: autoPresenceExpiry,
+                source: reason,
+                waitForServer: true
+            )
+            // Keep the "When In Use" safety-net timer in step with the new expiry
+            if autoCheckOutTimers[groupId] != nil {
+                startAutoCheckOutTimer(groupId: groupId)
+            }
+            AppLogger.debug("[PresenceService] confirm(\(reason)): still at \(group.name)")
+        }
+    }
+
+    /// When someone opens a group, ask the phones of anyone there who hasn't
+    /// confirmed recently to re-check (the server picks who gets a push and
+    /// rate-limits it). Skipped when everyone there is fresh.
+    func requestRecheckIfNeeded(groupId: String?) {
+        guard let groupId else { return }
+        let now = Date()
+        if let lastRequest = lastRecheckRequestAt[groupId],
+           now.timeIntervalSince(lastRequest) < PresencePolicy.recheckRequestInterval {
+            return
+        }
+
+        // If presence isn't loaded yet, let the server decide
+        if let summary = presenceByGroup[groupId] {
+            let currentUserId = Auth.auth().currentUser?.uid
+            let hasQuietMember = summary.presentMembers.contains { presence in
+                presence.userId != currentUserId
+                    && !presence.isManual
+                    && now.timeIntervalSince(presence.lastUpdated) > onDemandRecheckAfter
+            }
+            guard hasQuietMember else { return }
+        }
+
+        lastRecheckRequestAt[groupId] = now
+        Task {
+            await firestoreService.requestPresenceRecheck(groupId: groupId)
+        }
+    }
+
+    /// The current user's own presence in a group, from the live listener if
+    /// one is running, otherwise read directly (e.g. after a background launch).
+    private func ownPresence(in groupId: String) async -> Presence? {
+        guard let userId = Auth.auth().currentUser?.uid else { return nil }
+        if presenceListeners[groupId] != nil, let presences = rawPresenceByGroup[groupId] {
+            // The listener only returns isPresent == true docs
+            return presences.first { $0.userId == userId }
+        }
+        return await firestoreService.fetchOwnPresence(groupId: groupId)
     }
 
     // MARK: - Geofence Event Handlers
@@ -398,8 +510,7 @@ class PresenceService: ObservableObject {
         lastAutoUpdate[groupId] = Date()
         checkInTimes[groupId] = Date()
 
-        let expiresAt = Date().addingTimeInterval(TimeInterval(autoCheckOutMinutes * 60))
-        await firestoreService.updatePresence(groupId: groupId, isPresent: true, isManual: false, expiresAt: expiresAt)
+        await firestoreService.updatePresence(groupId: groupId, isPresent: true, isManual: false, expiresAt: autoPresenceExpiry, source: "geofence")
         await refreshPresence(groupId: groupId)
 
         // Update leaderboard entry and check top visitor achievement
@@ -441,7 +552,7 @@ class PresenceService: ObservableObject {
         }
 
         lastAutoUpdate[groupId] = Date()
-        await firestoreService.updatePresence(groupId: groupId, isPresent: false, isManual: false)
+        await firestoreService.updatePresence(groupId: groupId, isPresent: false, isManual: false, source: "geofence")
         await refreshPresence(groupId: groupId)
 
         // Track analytics
@@ -464,8 +575,8 @@ class PresenceService: ObservableObject {
             }
 
             lastAutoUpdate[groupId] = Date()
-            let expiresAt = isPresent ? Date().addingTimeInterval(TimeInterval(autoCheckOutMinutes * 60)) : nil
-            await firestoreService.updatePresence(groupId: groupId, isPresent: isPresent, isManual: false, expiresAt: expiresAt)
+            let expiresAt = isPresent ? autoPresenceExpiry : nil
+            await firestoreService.updatePresence(groupId: groupId, isPresent: isPresent, isManual: false, expiresAt: expiresAt, source: "location_check")
 
             // For "When In Use" users who are present, start a safety-net timer
             if isPresent && !hasAlwaysLocationPermission && autoCheckOutTimers[groupId] == nil {

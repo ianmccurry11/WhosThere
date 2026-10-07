@@ -245,29 +245,7 @@ struct GroupDetailView: View {
                                     .font(.headline)
 
                                 ForEach(presences) { presence in
-                                    HStack(spacing: 12) {
-                                        Circle()
-                                            .fill(Color.green)
-                                            .frame(width: 10, height: 10)
-                                            .accessibilityHidden(true)
-
-                                        if let level = presence.level, level > 0 {
-                                            LevelBadge(level: level)
-                                        }
-
-                                        Text(presence.displayName ?? "Unknown")
-                                            .font(.subheadline)
-
-                                        Spacer()
-
-                                        if presence.isManual {
-                                            Text("Manual")
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
-                                        }
-                                    }
-                                    .accessibilityElement(children: .combine)
-                                    .accessibilityLabel("\(presence.displayName ?? "Unknown") is here\(presence.isManual ? ", manual check-in" : "")")
+                                    WhoIsHereRow(presence: presence)
                                     .contextMenu {
                                         // Only show actions for other users, not yourself
                                         if presence.userId != Auth.auth().currentUser?.uid {
@@ -433,6 +411,7 @@ struct GroupDetailView: View {
             setupState()
             // Guarantees a live listener even if this group isn't on the map/list
             presenceService.focusPresence(on: group.id)
+            presenceService.requestRecheckIfNeeded(groupId: group.id)
         }
         .onDisappear {
             presenceService.focusPresence(on: nil)
@@ -597,4 +576,56 @@ struct GroupDetailView: View {
             Coordinate(latitude: 37.7749, longitude: -122.4184)
         ]
     ))
+}
+
+/// One person in the "Who's Here" list. Automatic check-ins that haven't been
+/// confirmed in the last 30 minutes are faded with "confirmed 1h ago".
+private struct WhoIsHereRow: View {
+    let presence: Presence
+
+    var body: some View {
+        // Re-evaluates the "confirmed …" label every minute
+        TimelineView(.everyMinute) { context in
+            let confirmation = presence.confirmationLabel(at: context.date)
+
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(confirmation == nil ? Color.green : Color.orange)
+                    .frame(width: 10, height: 10)
+                    .accessibilityHidden(true)
+
+                if let level = presence.level, level > 0 {
+                    LevelBadge(level: level)
+                }
+
+                Text(presence.displayName ?? "Unknown")
+                    .font(.subheadline)
+
+                Spacer()
+
+                if presence.isManual {
+                    Text("Manual")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else if let confirmation {
+                    Text(confirmation)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .opacity(confirmation == nil ? 1 : 0.6)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(accessibilityText(confirmation: confirmation))
+        }
+    }
+
+    private func accessibilityText(confirmation: String?) -> String {
+        var text = "\(presence.displayName ?? "Unknown") is here"
+        if presence.isManual {
+            text += ", manual check-in"
+        } else if let confirmation {
+            text += ", \(confirmation)"
+        }
+        return text
+    }
 }
