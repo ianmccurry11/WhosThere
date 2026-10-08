@@ -357,7 +357,9 @@ class FriendService: ObservableObject {
 
     /// Checks if a user is currently present at any of the current user's groups.
     func isUserNearby(_ userId: String) -> Bool {
-        for (_, summary) in presenceService.presenceByGroup {
+        // presenceByGroup also covers nearby public groups, so limit to joined ones
+        let joinedGroupIds = Set(firestoreService.joinedGroups.compactMap(\.id))
+        for (groupId, summary) in presenceService.presenceByGroup where joinedGroupIds.contains(groupId) {
             if summary.presentMembers.contains(where: { $0.userId == userId }) {
                 return true
             }

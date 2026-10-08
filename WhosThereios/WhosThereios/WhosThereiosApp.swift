@@ -20,6 +20,11 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // Configure notifications
         NotificationService.shared.configure()
 
+        // Create the presence + location services now, not when the first view
+        // appears: when iOS relaunches the app in the background for a geofence,
+        // visit or significant move, there is no UI, and the event would be lost
+        _ = PresenceService.shared
+
         return true
     }
 
@@ -41,6 +46,13 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     // Handle notification when app is in background
     func application(_ application: UIApplication,
                      didReceiveRemoteNotification userInfo: [AnyHashable: Any]) async -> UIBackgroundFetchResult {
+        // Silent "are you still there?" push from the presenceSweep /
+        // onPresenceRecheckRequest Cloud Functions
+        if userInfo["type"] as? String == "presenceRecheck" {
+            await PresenceService.shared.confirmPresence(reason: "recheck", force: true)
+            return .newData
+        }
+
         // Handle the notification
         NotificationService.shared.handleNotification(userInfo)
         return .newData

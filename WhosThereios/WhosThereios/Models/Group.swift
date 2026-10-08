@@ -186,3 +186,55 @@ struct LocationGroup: Identifiable, Codable {
         return isInside
     }
 }
+
+// MARK: - Distance to Boundary
+
+extension LocationGroup {
+    /// Meters from a coordinate to the nearest edge of the group's boundary,
+    /// or 0 when the coordinate is inside. Lets presence checks allow a margin
+    /// for GPS error instead of requiring the fix to land exactly in the box.
+    func distanceToBoundary(from coordinate: CLLocationCoordinate2D) -> CLLocationDistance {
+        guard boundary.count >= 3 else { return .infinity }
+        if contains(coordinate: coordinate) { return 0 }
+
+        // Flatten to local meters around the point; accurate at group scale
+        let metersPerDegreeLatitude = 111_320.0
+        let metersPerDegreeLongitude = metersPerDegreeLatitude * cos(coordinate.latitude * .pi / 180)
+        let points = boundary.map { vertex in
+            (x: (vertex.longitude - coordinate.longitude) * metersPerDegreeLongitude,
+             y: (vertex.latitude - coordinate.latitude) * metersPerDegreeLatitude)
+        }
+
+        var nearest = CLLocationDistance.infinity
+        for index in points.indices {
+            let start = points[index]
+            let end = points[(index + 1) % points.count]
+            nearest = min(nearest, Self.distanceFromOrigin(toSegmentFrom: start, to: end))
+        }
+        return nearest
+    }
+
+    /// Whether a location fix puts the user at this group, allowing for the
+    /// fix's accuracy (at least `PresencePolicy.confirmMargin`). Returns nil
+    /// when the fix is too inaccurate to say either way.
+    func isAt(_ location: CLLocation) -> Bool? {
+        let accuracy = location.horizontalAccuracy
+        guard accuracy >= 0, accuracy <= PresencePolicy.maxUsableAccuracy else { return nil }
+        let margin = max(PresencePolicy.confirmMargin, accuracy)
+        return distanceToBoundary(from: location.coordinate) <= margin
+    }
+
+    private static func distanceFromOrigin(
+        toSegmentFrom start: (x: Double, y: Double),
+        to end: (x: Double, y: Double)
+    ) -> Double {
+        let segmentX = end.x - start.x
+        let segmentY = end.y - start.y
+        let lengthSquared = segmentX * segmentX + segmentY * segmentY
+        guard lengthSquared > 0 else { return hypot(start.x, start.y) }
+
+        // Project the origin onto the segment, clamped to its endpoints
+        let projection = max(0, min(1, -(start.x * segmentX + start.y * segmentY) / lengthSquared))
+        return hypot(start.x + projection * segmentX, start.y + projection * segmentY)
+    }
+}
