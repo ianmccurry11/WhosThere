@@ -49,6 +49,8 @@ class PresenceService: ObservableObject {
     private var focusedGroupId: String?
     /// Groups where we're already writing a checkout for our own lapsed presence
     private var pendingStaleCheckouts: Set<String> = []
+    /// "groupId/userId" of other members' lapsed check-ins we've already cleared
+    private var clearedLapsedPresences: Set<String> = []
     /// Re-applies the freshness rule so lapsed check-ins drop off without a new snapshot
     private var expiryTickTask: Task<Void, Never>?
     private let expiryTickInterval: TimeInterval = 30
@@ -615,6 +617,22 @@ class PresenceService: ObservableObject {
         }
     }
 
+    /// Clears other members' lapsed check-ins in Firestore so they don't linger
+    /// for everyone else. They're already hidden here by `Presence.isActive`.
+    private func clearOthersLapsedPresences(in groupId: String) {
+        let currentUserId = Auth.auth().currentUser?.uid
+        let now = Date()
+        for presence in rawPresenceByGroup[groupId] ?? []
+        where presence.userId != currentUserId && presence.isPresent && !presence.isActive(at: now) {
+            let key = "\(groupId)/\(presence.userId)"
+            guard !clearedLapsedPresences.contains(key) else { continue }
+            clearedLapsedPresences.insert(key)
+            Task {
+                await firestoreService.clearLapsedPresence(groupId: groupId, userId: presence.userId)
+            }
+        }
+    }
+
     /// Checks if the current user has any stale presences and auto checks them out
     func checkAndClearStalePresences() async {
         for groupId in rawPresenceByGroup.keys {
@@ -689,6 +707,7 @@ class PresenceService: ObservableObject {
         rawPresenceByGroup[groupId] = presences
         publishSummary(for: groupId)
         checkOutOwnStalePresence(in: groupId)
+        clearOthersLapsedPresences(in: groupId)
     }
 
     private func publishSummary(for groupId: String, now: Date = Date()) {
@@ -726,6 +745,7 @@ class PresenceService: ObservableObject {
         where summary.presentMembers.contains(where: { !$0.isActive(at: now) }) {
             publishSummary(for: groupId, now: now)
             checkOutOwnStalePresence(in: groupId)
+            clearOthersLapsedPresences(in: groupId)
         }
     }
 

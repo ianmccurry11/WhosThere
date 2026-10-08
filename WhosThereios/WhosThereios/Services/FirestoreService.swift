@@ -930,6 +930,22 @@ class FirestoreService: ObservableObject {
         }
     }
 
+    /// Marks another member's lapsed check-in as not present. Security rules
+    /// only allow this once it has expired, so stale entries get cleared by
+    /// whichever member's phone notices first (no server needed).
+    func clearLapsedPresence(groupId: String, userId: String) async {
+        do {
+            try await db.collection("presence").document(groupId)
+                .collection("members").document(userId).updateData([
+                    "isPresent": false,
+                    "expiresAt": FieldValue.delete(),
+                    "source": "expired_cleanup"
+                ])
+        } catch {
+            AppLogger.debug("Error clearing lapsed presence \(groupId)/\(userId): \(error)")
+        }
+    }
+
     /// Reads the current user's own presence doc for a group directly, for
     /// background wakes where no listeners are running yet.
     func fetchOwnPresence(groupId: String) async -> Presence? {

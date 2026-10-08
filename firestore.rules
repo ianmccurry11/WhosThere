@@ -297,6 +297,17 @@ service cloud.firestore {
           && request.resource.data.isPresent is bool
           && request.resource.data.isManual is bool;
 
+        // Anyone signed in may clear someone else's check-in once it has
+        // lapsed (past expiresAt, or not updated in 5 hours), so stale
+        // entries get cleaned up without a server. Mirrors Presence.isActive.
+        allow update: if isAuthenticated()
+          && resource.data.isPresent == true
+          && (('expiresAt' in resource.data && resource.data.expiresAt < request.time)
+              || resource.data.lastUpdated < request.time - duration.value(5, 'h'))
+          && request.resource.data.isPresent == false
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['isPresent', 'expiresAt', 'source']);
+
         // Users can only delete their own presence
         allow delete: if isOwner(memberId);
       }
