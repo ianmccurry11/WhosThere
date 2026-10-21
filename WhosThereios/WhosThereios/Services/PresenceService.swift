@@ -54,14 +54,30 @@ class PresenceService: ObservableObject {
     /// Re-applies the freshness rule so lapsed check-ins drop off without a new snapshot
     private var expiryTickTask: Task<Void, Never>?
     private let expiryTickInterval: TimeInterval = 30
-    /// Last time `confirmPresence` ran, to throttle background wakes
-    private var lastConfirmAt: Date?
     /// Last time this device asked the server to re-check each group
     private var lastRecheckRequestAt: [String: Date] = [:]
     /// Matches ON_DEMAND_RECHECK_AFTER_MS in the Cloud Function
     private let onDemandRecheckAfter: TimeInterval = 10 * 60
-    private var lastAutoUpdate: [String: Date] = [:]
-    private let updateThrottle: TimeInterval = 30 // Minimum seconds between auto-updates
+
+    // Detection state
+    /// When readings first said "clearly outside" each group
+    private var outsideSince: [String: Date] = [:]
+    private var isEvaluating = false
+    /// Triggers that arrived while an evaluation was running; merged into one more pass
+    private var pendingTriggers: [PresenceTrigger] = []
+    private var lastStreamEvaluationAt: Date?
+    /// Groups the user manually checked out of: no auto check-in until they leave.
+    /// Persisted so it survives the app being relaunched in the background.
+    private var suppressedGroupIds: Set<String> = [] {
+        didSet { UserDefaults.standard.set(Array(suppressedGroupIds), forKey: suppressedGroupsKey) }
+    }
+    /// Groups we believe we're automatically checked in to, so background wakes
+    /// know which far-away groups to check out of without reading every group
+    private var autoCheckedInGroupIds: Set<String> = [] {
+        didSet { UserDefaults.standard.set(Array(autoCheckedInGroupIds), forKey: autoCheckedInGroupsKey) }
+    }
+    private let suppressedGroupsKey = "suppressedAutoCheckInGroups"
+    private let autoCheckedInGroupsKey = "autoCheckedInGroups"
     private var checkOutTimerTasks: [String: Task<Void, Never>] = [:]
 
     /// UserDefaults key for persisted auto-checkout expiration times
@@ -73,6 +89,8 @@ class PresenceService: ObservableObject {
     private let heartbeatInterval: TimeInterval = 15 * 60  // 15 minutes
 
     init() {
+        suppressedGroupIds = Set(UserDefaults.standard.stringArray(forKey: suppressedGroupsKey) ?? [])
+        autoCheckedInGroupIds = Set(UserDefaults.standard.stringArray(forKey: autoCheckedInGroupsKey) ?? [])
         setupLocationCallbacks()
         restorePersistedTimers()
         observeDisplayedGroups()
@@ -99,25 +117,49 @@ class PresenceService: ObservableObject {
         return Date().addingTimeInterval(duration)
     }
 
+    /// Every location signal funnels into `evaluatePresence`, which makes the
+    /// actual decision against the group boundary with a fresh fix.
     private func setupLocationCallbacks() {
-        // Handle entering a region
-        locationService.onEnterRegion = { [weak self] groupId in
+        locationService.onEnterRegion = { [weak self] _ in
             Task { @MainActor in
-                await self?.handleRegionEnter(groupId: groupId)
+                await self?.evaluatePresence(PresenceTrigger(reason: "geofence_enter"))
             }
         }
 
-        // Handle exiting a region
-        locationService.onExitRegion = { [weak self] groupId in
+        locationService.onExitRegion = { [weak self] regionId in
             Task { @MainActor in
-                await self?.handleRegionExit(groupId: groupId)
+                if regionId == LocationService.refreshRingIdentifier {
+                    // Moved far enough that the nearest groups need re-picking
+                    await self?.evaluatePresence(PresenceTrigger(reason: "moved", refreshesRegions: true))
+                } else {
+                    await self?.evaluatePresence(PresenceTrigger(reason: "geofence_exit", exitedGroupIds: [regionId]))
+                }
             }
         }
 
-        // Significant moves and visits: re-confirm we're still where we said
+        // iOS answered "are we inside?" for a newly registered geofence
+        locationService.onRegionState = { [weak self] regionId, _ in
+            guard regionId != LocationService.refreshRingIdentifier else { return }
+            Task { @MainActor in
+                await self?.evaluatePresence(PresenceTrigger(reason: "geofence_state"))
+            }
+        }
+
+        // Significant moves and visits while in the background
         locationService.onBackgroundWake = { [weak self] trigger in
             Task { @MainActor in
-                await self?.confirmPresence(reason: trigger)
+                await self?.evaluatePresence(PresenceTrigger(
+                    reason: trigger,
+                    isDeparture: trigger == "visit_departure",
+                    isLocationStream: trigger == "location"
+                ))
+            }
+        }
+
+        // Continuous updates while the app is open
+        locationService.onForegroundLocation = { [weak self] in
+            Task { @MainActor in
+                await self?.evaluatePresence(PresenceTrigger(reason: "foreground_location", isLocationStream: true))
             }
         }
     }
@@ -130,7 +172,7 @@ class PresenceService: ObservableObject {
 
         // Do initial presence check
         Task {
-            await checkAndUpdateAllPresence(groups: groups)
+            await evaluatePresence(PresenceTrigger(reason: "launch"))
         }
     }
 
@@ -147,6 +189,7 @@ class PresenceService: ObservableObject {
 
     func manualCheckIn(groupId: String) async {
         manualOverrides[groupId] = true
+        suppressedGroupIds.remove(groupId)
         checkInTimes[groupId] = Date()
 
         let expiresAt = Date().addingTimeInterval(TimeInterval(autoCheckOutMinutes * 60))
@@ -188,6 +231,9 @@ class PresenceService: ObservableObject {
         let remainingMembers = countRemainingMembers(groupId: groupId)
 
         manualOverrides[groupId] = false
+        // Don't auto check them straight back in: wait until they've left
+        suppressedGroupIds.insert(groupId)
+        autoCheckedInGroupIds.remove(groupId)
         await firestoreService.updatePresence(groupId: groupId, isPresent: false, isManual: true)
         await refreshPresence(groupId: groupId)
 
@@ -257,6 +303,7 @@ class PresenceService: ObservableObject {
         }
 
         manualOverrides.removeValue(forKey: groupId)
+        autoCheckedInGroupIds.remove(groupId)
         autoCheckOutTimers.removeValue(forKey: groupId)
         checkOutTimerTasks[groupId]?.cancel()
         checkOutTimerTasks.removeValue(forKey: groupId)
@@ -384,27 +431,85 @@ class PresenceService: ObservableObject {
             AppLogger.debug("[PresenceService] Heartbeat refreshed manual presence for group \(groupId)")
         }
 
-        await confirmPresence(reason: "heartbeat", force: true)
+        await confirmPresence(reason: "heartbeat")
     }
 
-    // MARK: - Re-confirming Automatic Check-ins
+    // MARK: - Automatic Detection
 
-    /// Re-checks the user's location against every group they're automatically
-    /// checked in to, and pushes each check-in's expiry forward if they're still
-    /// there. Runs on every wake: silent re-check pushes from the server,
-    /// significant moves, visits, opening the app, and the foreground heartbeat.
-    ///
-    /// This never checks anyone out. A check-in that can't be confirmed shows as
-    /// "confirmed 1h ago", then expires on its own.
-    func confirmPresence(reason: String, force: Bool = false) async {
-        if !force, let lastConfirmAt,
-           Date().timeIntervalSince(lastConfirmAt) < PresencePolicy.minConfirmInterval {
+    /// Something that may mean the user arrived somewhere or left
+    struct PresenceTrigger {
+        let reason: String
+        /// Groups whose geofence iOS says we just left
+        var exitedGroupIds: Set<String> = []
+        /// iOS says a visit just ended (the user left a place)
+        var isDeparture = false
+        /// Frequent location update; throttled
+        var isLocationStream = false
+        /// Re-pick the nearest geofences first
+        var refreshesRegions = false
+
+        /// Several triggers that queued up during one evaluation, as one
+        init(merging triggers: [PresenceTrigger]) {
+            reason = triggers.map(\.reason).joined(separator: "+")
+            exitedGroupIds = triggers.reduce(into: Set<String>()) { $0.formUnion($1.exitedGroupIds) }
+            isDeparture = triggers.contains { $0.isDeparture }
+            isLocationStream = triggers.allSatisfy { $0.isLocationStream }
+            refreshesRegions = triggers.contains { $0.refreshesRegions }
+        }
+
+        init(
+            reason: String,
+            exitedGroupIds: Set<String> = [],
+            isDeparture: Bool = false,
+            isLocationStream: Bool = false,
+            refreshesRegions: Bool = false
+        ) {
+            self.reason = reason
+            self.exitedGroupIds = exitedGroupIds
+            self.isDeparture = isDeparture
+            self.isLocationStream = isLocationStream
+            self.refreshesRegions = refreshesRegions
+        }
+    }
+
+    /// Re-evaluate now (silent re-check push, opening the app, heartbeat)
+    func confirmPresence(reason: String) async {
+        await evaluatePresence(PresenceTrigger(reason: reason))
+    }
+
+    /// Runs the check-in/check-out rules for every nearby group. Evaluations
+    /// never overlap: triggers arriving mid-run are merged into one more pass.
+    func evaluatePresence(_ trigger: PresenceTrigger) async {
+        if trigger.isLocationStream {
+            if isEvaluating { return }
+            if let lastStreamEvaluationAt,
+               Date().timeIntervalSince(lastStreamEvaluationAt) < PresencePolicy.foregroundEvaluationInterval {
+                return
+            }
+            lastStreamEvaluationAt = Date()
+        }
+
+        guard !isEvaluating else {
+            pendingTriggers.append(trigger)
             return
         }
-        lastConfirmAt = Date()
+        isEvaluating = true
+
+        var current = trigger
+        while true {
+            await runEvaluation(current)
+            guard !pendingTriggers.isEmpty else { break }
+            current = PresenceTrigger(merging: pendingTriggers)
+            pendingTriggers.removeAll()
+        }
+        isEvaluating = false
+    }
+
+    private func runEvaluation(_ trigger: PresenceTrigger) async {
+        guard Auth.auth().currentUser != nil else { return }
 
         // Ask iOS for extra time: in the background we may only get a few seconds
-        let backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "ConfirmPresence")
+        let backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "EvaluatePresence")
         defer {
             if backgroundTask != .invalid {
                 UIApplication.shared.endBackgroundTask(backgroundTask)
@@ -415,37 +520,101 @@ class PresenceService: ObservableObject {
         if firestoreService.joinedGroups.isEmpty {
             await firestoreService.fetchJoinedGroups()
         }
+        let groups = firestoreService.joinedGroups
+        guard !groups.isEmpty else { return }
 
-        var checkedInGroups: [LocationGroup] = []
-        for group in firestoreService.joinedGroups {
-            guard let groupId = group.id, manualOverrides[groupId] != true else { continue }
-            if let own = await ownPresence(in: groupId), own.isActive(), !own.isManual {
-                checkedInGroups.append(group)
-            }
-        }
-        guard !checkedInGroups.isEmpty else { return }
-
-        guard let location = await locationService.requestFreshLocation(timeout: 10) else {
-            AppLogger.debug("[PresenceService] confirm(\(reason)): no usable location fix")
+        // Insist on a recent fix: after an exit, an older one may predate leaving
+        let maxAge: TimeInterval = trigger.isLocationStream ? 30 : 20
+        guard let location = await locationService.requestFreshLocation(maxAge: maxAge, timeout: 10) else {
+            AppLogger.debug("[PresenceService] evaluate(\(trigger.reason)): no usable location fix")
             return
         }
 
-        for group in checkedInGroups where group.isAt(location) == true {
+        if trigger.refreshesRegions {
+            locationService.refreshMonitoredRegions()
+        }
+
+        for group in groups {
             guard let groupId = group.id else { continue }
+            let isNearby = group.distanceToBoundary(from: location.coordinate) <= PresencePolicy.candidateDistance
+            guard isNearby
+                    || autoCheckedInGroupIds.contains(groupId)
+                    || suppressedGroupIds.contains(groupId) else { continue }
+
+            let reading = group.zoneReading(for: location)
+            switch reading {
+            case .outside:
+                if outsideSince[groupId] == nil { outsideSince[groupId] = Date() }
+            case .inside, .nearby:
+                outsideSince[groupId] = nil
+            case .unknown:
+                break
+            }
+
+            let state = await autoPresenceState(in: groupId)
+            let action = AutoPresenceDecider.decide(
+                reading: reading,
+                state: state,
+                hasExitSignal: trigger.isDeparture || trigger.exitedGroupIds.contains(groupId)
+            )
+            if action != .none {
+                AppLogger.debug("[PresenceService] evaluate(\(trigger.reason)) \(group.name): \(reading) -> \(action)")
+            }
+            await apply(action, groupId: groupId, source: trigger.reason)
+        }
+    }
+
+    /// The user's own state at a group, and keeps the local record in step with it
+    private func autoPresenceState(in groupId: String) async -> AutoPresenceState {
+        let own = await ownPresence(in: groupId)
+        let isActive = own?.isActive() ?? false
+        let isManual = own?.isManual ?? false
+
+        let state = AutoPresenceState(
+            isAutoCheckedIn: isActive && !isManual,
+            isManuallyCheckedIn: manualOverrides[groupId] == true || (isActive && isManual),
+            isSuppressed: suppressedGroupIds.contains(groupId),
+            lastWrite: own?.lastUpdated,
+            outsideSince: outsideSince[groupId]
+        )
+        if state.isAutoCheckedIn {
+            autoCheckedInGroupIds.insert(groupId)
+        } else {
+            autoCheckedInGroupIds.remove(groupId)
+        }
+        return state
+    }
+
+    private func apply(_ action: AutoPresenceAction, groupId: String, source: String) async {
+        switch action {
+        case .checkIn:
+            await performAutoCheckIn(groupId: groupId, source: source)
+        case .refresh:
             await firestoreService.updatePresence(
                 groupId: groupId,
                 isPresent: true,
                 isManual: false,
                 expiresAt: autoPresenceExpiry,
-                source: reason,
-                waitForServer: true
+                source: source,
+                waitForServer: isInBackground
             )
             // Keep the "When In Use" safety-net timer in step with the new expiry
             if autoCheckOutTimers[groupId] != nil {
                 startAutoCheckOutTimer(groupId: groupId)
             }
-            AppLogger.debug("[PresenceService] confirm(\(reason)): still at \(group.name)")
+        case .checkOut:
+            outsideSince[groupId] = nil
+            await performAutoExit(groupId: groupId, source: source)
+        case .clearSuppression:
+            suppressedGroupIds.remove(groupId)
+            manualOverrides.removeValue(forKey: groupId)
+        case .none:
+            break
         }
+    }
+
+    private var isInBackground: Bool {
+        UIApplication.shared.applicationState != .active
     }
 
     /// When someone opens a group, ask the phones of anyone there who hasn't
@@ -487,33 +656,39 @@ class PresenceService: ObservableObject {
         return await firestoreService.fetchOwnPresence(groupId: groupId)
     }
 
-    // MARK: - Geofence Event Handlers
+    // MARK: - Automatic Check-in/out
 
-    private func handleRegionEnter(groupId: String) async {
-        // Don't update if manually checked out
-        if manualOverrides[groupId] == false {
-            return
-        }
-
-        // Throttle auto updates
-        if let lastUpdate = lastAutoUpdate[groupId],
-           Date().timeIntervalSince(lastUpdate) < updateThrottle {
-            return
-        }
-
-        // Cancel any manual check-in timer - geofencing takes over now
+    private func performAutoCheckIn(groupId: String, source: String) async {
+        // Already checked in by hand: detection takes over, but it's not a new visit
+        let wasManuallyCheckedIn = manualOverrides[groupId] == true
         if autoCheckOutTimers[groupId] != nil {
-            AppLogger.debug("[PresenceService] handleRegionEnter - Cancelling timer, geofencing takes over for group \(groupId)")
             cancelAutoCheckOutTimer(groupId: groupId)
-            // Clear manual override since geofencing is now in control
-            manualOverrides.removeValue(forKey: groupId)
+        }
+        manualOverrides.removeValue(forKey: groupId)
+        suppressedGroupIds.remove(groupId)
+        autoCheckedInGroupIds.insert(groupId)
+        if !wasManuallyCheckedIn {
+            checkInTimes[groupId] = Date()
         }
 
-        lastAutoUpdate[groupId] = Date()
-        checkInTimes[groupId] = Date()
-
-        await firestoreService.updatePresence(groupId: groupId, isPresent: true, isManual: false, expiresAt: autoPresenceExpiry, source: "geofence")
+        await firestoreService.updatePresence(
+            groupId: groupId,
+            isPresent: true,
+            isManual: false,
+            expiresAt: autoPresenceExpiry,
+            source: source,
+            waitForServer: isInBackground
+        )
         await refreshPresence(groupId: groupId)
+
+        // For "When In Use" users, start a safety-net auto-checkout timer
+        // since they won't get geofence exit events when the app is backgrounded
+        if !hasAlwaysLocationPermission {
+            AppLogger.debug("[PresenceService] performAutoCheckIn - 'When In Use' user, starting safety timer for \(autoCheckOutMinutes) min")
+            startAutoCheckOutTimer(groupId: groupId)
+        }
+
+        guard !wasManuallyCheckedIn else { return }
 
         // Update leaderboard entry and check top visitor achievement
         await firestoreService.updateLeaderboardEntry(groupId: groupId)
@@ -529,21 +704,9 @@ class PresenceService: ObservableObject {
 
         // Track analytics
         analyticsService.trackCheckIn(groupId: groupId, isManual: false)
-
-        // For "When In Use" users, start a safety-net auto-checkout timer
-        // since they won't get geofence exit events when the app is backgrounded
-        if !hasAlwaysLocationPermission {
-            AppLogger.debug("[PresenceService] handleRegionEnter - 'When In Use' user, starting safety timer for \(autoCheckOutMinutes) min")
-            startAutoCheckOutTimer(groupId: groupId)
-        }
     }
 
-    private func handleRegionExit(groupId: String) async {
-        // Don't update if manually checked in
-        if manualOverrides[groupId] == true {
-            return
-        }
-
+    private func performAutoExit(groupId: String, source: String) async {
         // Calculate duration
         let durationMinutes: Int
         if let checkInTime = checkInTimes[groupId] {
@@ -553,47 +716,21 @@ class PresenceService: ObservableObject {
             durationMinutes = 0
         }
 
-        lastAutoUpdate[groupId] = Date()
-        await firestoreService.updatePresence(groupId: groupId, isPresent: false, isManual: false, source: "geofence")
+        autoCheckedInGroupIds.remove(groupId)
+        if autoCheckOutTimers[groupId] != nil {
+            cancelAutoCheckOutTimer(groupId: groupId)
+        }
+        await firestoreService.updatePresence(
+            groupId: groupId,
+            isPresent: false,
+            isManual: false,
+            source: source,
+            waitForServer: isInBackground
+        )
         await refreshPresence(groupId: groupId)
 
         // Track analytics
         analyticsService.trackCheckOut(groupId: groupId, isManual: false, durationMinutes: durationMinutes)
-    }
-
-    func checkAndUpdateAllPresence(groups: [LocationGroup]) async {
-        let presenceMap = locationService.checkPresenceInGroups(groups)
-
-        for (groupId, isPresent) in presenceMap {
-            // Skip if there's a manual override
-            if manualOverrides[groupId] != nil {
-                continue
-            }
-
-            // Throttle updates
-            if let lastUpdate = lastAutoUpdate[groupId],
-               Date().timeIntervalSince(lastUpdate) < updateThrottle {
-                continue
-            }
-
-            lastAutoUpdate[groupId] = Date()
-            let expiresAt = isPresent ? autoPresenceExpiry : nil
-            await firestoreService.updatePresence(groupId: groupId, isPresent: isPresent, isManual: false, expiresAt: expiresAt, source: "location_check")
-
-            // For "When In Use" users who are present, start a safety-net timer
-            if isPresent && !hasAlwaysLocationPermission && autoCheckOutTimers[groupId] == nil {
-                checkInTimes[groupId] = Date()
-                AppLogger.debug("[PresenceService] initialSweep - 'When In Use' user present at \(groupId), starting safety timer")
-                startAutoCheckOutTimer(groupId: groupId)
-            }
-        }
-
-        // Refresh all presence data
-        for group in groups {
-            if let groupId = group.id {
-                await refreshPresence(groupId: groupId)
-            }
-        }
     }
 
     // MARK: - Stale Presence Cleanup

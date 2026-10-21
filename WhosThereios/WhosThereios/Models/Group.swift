@@ -214,14 +214,31 @@ extension LocationGroup {
         return nearest
     }
 
-    /// Whether a location fix puts the user at this group, allowing for the
-    /// fix's accuracy (at least `PresencePolicy.confirmMargin`). Returns nil
-    /// when the fix is too inaccurate to say either way.
-    func isAt(_ location: CLLocation) -> Bool? {
+    /// Where a location fix puts the user relative to this group, allowing for
+    /// GPS error: within max(30m, accuracy) counts as inside; beyond
+    /// 75m + accuracy is clearly outside; in between is "nearby".
+    func zoneReading(for location: CLLocation) -> ZoneReading {
         let accuracy = location.horizontalAccuracy
-        guard accuracy >= 0, accuracy <= PresencePolicy.maxUsableAccuracy else { return nil }
-        let margin = max(PresencePolicy.confirmMargin, accuracy)
-        return distanceToBoundary(from: location.coordinate) <= margin
+        guard accuracy >= 0, accuracy <= PresencePolicy.maxUsableAccuracy else { return .unknown }
+
+        let distance = distanceToBoundary(from: location.coordinate)
+        if distance <= max(PresencePolicy.confirmMargin, accuracy) {
+            return .inside
+        }
+        if distance > PresencePolicy.exitMargin + accuracy {
+            return .outside
+        }
+        return .nearby
+    }
+
+    /// Whether a location fix puts the user at this group, or nil when the fix
+    /// is too inaccurate to say either way.
+    func isAt(_ location: CLLocation) -> Bool? {
+        switch zoneReading(for: location) {
+        case .unknown: return nil
+        case .inside: return true
+        case .nearby, .outside: return false
+        }
     }
 
     private static func distanceFromOrigin(

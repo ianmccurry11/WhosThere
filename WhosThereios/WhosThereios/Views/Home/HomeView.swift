@@ -40,6 +40,17 @@ struct HomeView: View {
                             .transition(.move(edge: .top).combined(with: .opacity))
                     }
 
+                    // Location settings that stop automatic check-in from working
+                    if let warning = locationSettingsWarning {
+                        StatusBanner(
+                            message: warning,
+                            type: .warning,
+                            action: openAppSettings,
+                            actionLabel: "Fix"
+                        )
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+
                     // Name nudge banner
                     if showNameNudge {
                         HStack(spacing: 12) {
@@ -235,6 +246,27 @@ struct HomeView: View {
             default:
                 break
             }
+        }
+    }
+
+    /// Why automatic check-in can't work on this phone, if it can't
+    private var locationSettingsWarning: String? {
+        switch locationService.authorizationStatus {
+        case .authorizedAlways:
+            return locationService.hasPreciseLocation
+                ? nil
+                : "Turn on Precise Location so you're checked in at the right place"
+        case .authorizedWhenInUse:
+            return "Set location to \"Always\" to be checked in without opening the app"
+        default:
+            // Denied is covered by the map's own overlay; not asked yet needs no nag
+            return nil
+        }
+    }
+
+    private func openAppSettings() {
+        if let url = URL(string: UIApplication.openSettingsURLString) {
+            UIApplication.shared.open(url)
         }
     }
 

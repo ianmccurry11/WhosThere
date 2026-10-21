@@ -49,7 +49,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // Silent "are you still there?" push from the presenceSweep /
         // onPresenceRecheckRequest Cloud Functions
         if userInfo["type"] as? String == "presenceRecheck" {
-            await PresenceService.shared.confirmPresence(reason: "recheck", force: true)
+            await PresenceService.shared.confirmPresence(reason: "recheck")
             return .newData
         }
 

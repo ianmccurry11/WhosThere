@@ -22,10 +22,97 @@ enum PresencePolicy {
     static let confirmMargin: CLLocationDistance = 30
     /// Fixes less accurate than this can't confirm anything
     static let maxUsableAccuracy: CLLocationDistance = 100
-    /// Don't re-confirm more often than this from background wakes
-    static let minConfirmInterval: TimeInterval = 5 * 60
     /// Don't ask other members' phones to re-check more often than this per group
     static let recheckRequestInterval: TimeInterval = 5 * 60
+
+    // MARK: Detection
+
+    /// Clearly gone: farther than this (plus the fix's accuracy) from the boundary.
+    /// Between `confirmMargin` and this nothing changes, so people don't flicker.
+    static let exitMargin: CLLocationDistance = 75
+    /// Without a geofence exit or visit departure, need to be clearly gone for
+    /// this long (two readings) before checking out
+    static let exitConfirmDelay: TimeInterval = 2 * 60
+    /// While inside, rewrite the check-in at most this often to keep it fresh
+    static let refreshInterval: TimeInterval = 10 * 60
+    /// While the app is open, evaluate the location stream at most this often
+    static let foregroundEvaluationInterval: TimeInterval = 15
+    /// Only evaluate groups within this distance (plus ones you're checked in to)
+    static let candidateDistance: CLLocationDistance = 2_000
+    /// iOS geofences smaller than this are unreliable
+    static let minRegionRadius: CLLocationDistance = 150
+    /// Radius of the "you moved, refresh the nearest geofences" ring
+    static let refreshRingRadius: CLLocationDistance = 1_500
+}
+
+/// Where a location fix puts the user relative to a group's boundary
+enum ZoneReading: Equatable {
+    /// Within the margin: counts as there
+    case inside
+    /// Just outside the margin but not clearly gone: keep whatever state we have
+    case nearby
+    /// Clearly away from the group
+    case outside
+    /// The fix is too inaccurate to tell
+    case unknown
+}
+
+/// What to do with the user's automatic presence at one group
+enum AutoPresenceAction: Equatable {
+    case checkIn
+    case refresh
+    case checkOut
+    /// They manually checked out and have now left: allow auto check-in again
+    case clearSuppression
+    case none
+}
+
+/// The user's own state at one group, as far as detection is concerned
+struct AutoPresenceState {
+    var isAutoCheckedIn = false
+    var isManuallyCheckedIn = false
+    /// Manually checked out here; no auto check-in until they leave
+    var isSuppressed = false
+    /// When their presence doc was last written
+    var lastWrite: Date?
+    /// When readings first said "clearly outside" (reset by any other reading)
+    var outsideSince: Date?
+}
+
+enum AutoPresenceDecider {
+    /// The whole check-in/check-out rule in one place.
+    /// - Parameter hasExitSignal: iOS independently reported leaving (geofence
+    ///   exit or visit departure), so one "outside" reading is enough.
+    static func decide(
+        reading: ZoneReading,
+        state: AutoPresenceState,
+        hasExitSignal: Bool,
+        now: Date = Date()
+    ) -> AutoPresenceAction {
+        switch reading {
+        case .unknown, .nearby:
+            return .none
+
+        case .inside:
+            if state.isSuppressed { return .none }
+            if !state.isAutoCheckedIn { return .checkIn }
+            if let lastWrite = state.lastWrite,
+               now.timeIntervalSince(lastWrite) < PresencePolicy.refreshInterval {
+                return .none
+            }
+            return .refresh
+
+        case .outside:
+            if state.isSuppressed { return .clearSuppression }
+            guard state.isAutoCheckedIn, !state.isManuallyCheckedIn else { return .none }
+            if hasExitSignal { return .checkOut }
+            if let outsideSince = state.outsideSince,
+               now.timeIntervalSince(outsideSince) >= PresencePolicy.exitConfirmDelay {
+                return .checkOut
+            }
+            return .none
+        }
+    }
 }
 
 struct Presence: Identifiable, Codable {

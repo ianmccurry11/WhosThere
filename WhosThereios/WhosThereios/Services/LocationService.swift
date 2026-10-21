@@ -23,6 +23,9 @@ class LocationService: NSObject, ObservableObject {
     @Published var authorizationStatus: CLAuthorizationStatus = .notDetermined
     @Published var isMonitoring = false
     @Published var errorMessage: String?
+    /// False when the user turned off Precise Location; fixes are then off by
+    /// a mile or more and can never match a group's boundary
+    @Published var hasPreciseLocation = true
 
     private let locationManager = CLLocationManager()
     private var monitoredGroups: [String: LocationGroup] = [:]
@@ -32,6 +35,17 @@ class LocationService: NSObject, ObservableObject {
     /// iOS woke the app in the background with new location info
     /// (significant move or a visit). The argument names the trigger.
     var onBackgroundWake: ((String) -> Void)?
+    /// New location from the continuous stream while the app is open
+    var onForegroundLocation: (() -> Void)?
+    /// iOS reported whether we're inside a group's geofence (identifier, inside?)
+    var onRegionState: ((String, Bool) -> Void)?
+
+    /// Identifier of the extra geofence around the user's position: leaving it
+    /// means they've moved far enough that the nearest groups need re-picking
+    static let refreshRingIdentifier = "__refresh_ring__"
+    /// Groups last passed to `startMonitoringGroups`, kept so the regions can be
+    /// re-picked when the user moves or a first location arrives
+    private var groupsToMonitor: [LocationGroup] = []
 
     /// Callers waiting on `requestFreshLocation`
     private var pendingLocationRequests: [UUID: CheckedContinuation<CLLocation?, Never>] = [:]
@@ -41,6 +55,7 @@ class LocationService: NSObject, ObservableObject {
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
         authorizationStatus = locationManager.authorizationStatus
+        hasPreciseLocation = locationManager.accuracyAuthorization == .fullAccuracy
     }
 
     // MARK: - Permission Handling
@@ -131,57 +146,69 @@ class LocationService: NSObject, ObservableObject {
 
     // MARK: - Geofence Registration (max 20 regions on iOS)
 
+    /// Registers geofences for the nearest groups (iOS allows 20 regions: 19
+    /// groups plus a refresh ring around the user). Then asks iOS whether
+    /// we're already inside each one, since iOS only reports *crossings* and
+    /// would otherwise never tell us about a zone we started in.
     func startMonitoringGroups(_ groups: [LocationGroup]) {
+        groupsToMonitor = groups
+
         // Geofence monitoring requires "Always" authorization
-        // Without it, we skip region monitoring (users will need to check in manually)
+        // Without it, we skip region monitoring (detection only runs while the app is open)
         guard authorizationStatus == .authorizedAlways else {
             AppLogger.debug("Skipping geofence monitoring - requires 'Always' location permission")
             isMonitoring = false
             return
         }
 
-        // iOS limits monitoring to 20 regions
-        // Sort by distance and monitor the nearest ones
-        guard let currentLoc = currentLocation else {
-            // Start location updates first if we don't have location
+        // Without a location yet, register in list order; re-picked by distance
+        // once the first location arrives
+        var nearestGroups = groups
+        if let currentLoc = currentLocation {
+            nearestGroups.sort { group1, group2 in
+                currentLoc.distance(from: CLLocation(latitude: group1.centerLatitude, longitude: group1.centerLongitude))
+                    < currentLoc.distance(from: CLLocation(latitude: group2.centerLatitude, longitude: group2.centerLongitude))
+            }
+        } else {
             startUpdatingLocation()
-            return
         }
 
-        // Stop monitoring all current regions
         for region in locationManager.monitoredRegions {
             locationManager.stopMonitoring(for: region)
         }
         monitoredGroups.removeAll()
 
-        // Sort groups by distance from current location
-        let sortedGroups = groups.sorted { group1, group2 in
-            let loc1 = CLLocation(latitude: group1.centerLatitude, longitude: group1.centerLongitude)
-            let loc2 = CLLocation(latitude: group2.centerLatitude, longitude: group2.centerLongitude)
-            return currentLoc.distance(from: loc1) < currentLoc.distance(from: loc2)
-        }
-
-        // Monitor up to 20 nearest groups
-        let groupsToMonitor = Array(sortedGroups.prefix(20))
-
-        for group in groupsToMonitor {
+        for group in nearestGroups.prefix(19) {
             guard let groupId = group.id else { continue }
-
-            // Use circular region centered on group with radius based on boundary
-            let radius = calculateRadius(for: group)
             let region = CLCircularRegion(
                 center: group.center,
-                radius: radius,
+                radius: geofenceRadius(for: group),
                 identifier: groupId
             )
             region.notifyOnEntry = true
             region.notifyOnExit = true
-
             locationManager.startMonitoring(for: region)
             monitoredGroups[groupId] = group
         }
 
+        if let currentLoc = currentLocation {
+            let ring = CLCircularRegion(
+                center: currentLoc.coordinate,
+                radius: PresencePolicy.refreshRingRadius,
+                identifier: Self.refreshRingIdentifier
+            )
+            ring.notifyOnEntry = false
+            ring.notifyOnExit = true
+            locationManager.startMonitoring(for: ring)
+        }
+
         isMonitoring = true
+    }
+
+    /// Re-picks the nearest groups around the current location
+    func refreshMonitoredRegions() {
+        guard !groupsToMonitor.isEmpty else { return }
+        startMonitoringGroups(groupsToMonitor)
     }
 
     func stopMonitoringAllGroups() {
@@ -222,7 +249,7 @@ class LocationService: NSObject, ObservableObject {
         }
 
         // Add padding and enforce limits
-        let radius = min(max(maxDistance * 1.1, 50), locationManager.maximumRegionMonitoringDistance)
+        let radius = min(max(maxDistance * 1.1, PresencePolicy.minRegionRadius), locationManager.maximumRegionMonitoringDistance)
 
         // Create and monitor new region
         let region = CLCircularRegion(
@@ -265,21 +292,18 @@ class LocationService: NSObject, ObservableObject {
         return group.contains(coordinate: currentLoc.coordinate)
     }
 
-    private func calculateRadius(for group: LocationGroup) -> CLLocationDistance {
-        guard !group.boundary.isEmpty else { return 100 }
-
-        let center = group.center
-        var maxDistance: CLLocationDistance = 0
-
-        for coord in group.boundaryCoordinates {
-            let pointLocation = CLLocation(latitude: coord.latitude, longitude: coord.longitude)
-            let centerLocation = CLLocation(latitude: center.latitude, longitude: center.longitude)
-            let distance = pointLocation.distance(from: centerLocation)
-            maxDistance = max(maxDistance, distance)
-        }
-
-        // Add 10% buffer
-        return maxDistance * 1.1
+    /// Circle around the group's boundary used as a wake-up trigger: the
+    /// farthest corner plus 10%, never below the ~150m iOS handles reliably.
+    /// The real in/out decision is made against the boundary afterwards.
+    private func geofenceRadius(for group: LocationGroup) -> CLLocationDistance {
+        let center = CLLocation(latitude: group.center.latitude, longitude: group.center.longitude)
+        let farthestCorner = group.boundaryCoordinates
+            .map { center.distance(from: CLLocation(latitude: $0.latitude, longitude: $0.longitude)) }
+            .max() ?? 0
+        return min(
+            max(farthestCorner * 1.1, PresencePolicy.minRegionRadius),
+            locationManager.maximumRegionMonitoringDistance
+        )
     }
 
     func distanceToGroup(_ group: LocationGroup) -> CLLocationDistance? {
@@ -295,17 +319,40 @@ extension LocationService: CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let location = locations.last else { return }
         Task { @MainActor in
+            let isFirstLocation = self.currentLocation == nil
             self.currentLocation = location
             self.resolveAllLocationRequests(with: location)
+
+            // Regions registered before we had a location: re-pick by distance
+            if isFirstLocation {
+                self.refreshMonitoredRegions()
+            }
+
             if UIApplication.shared.applicationState == .background {
                 self.onBackgroundWake?("location")
+            } else {
+                self.onForegroundLocation?()
             }
         }
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didVisit visit: CLVisit) {
+        // An open-ended visit is an arrival; one with a departure date means they left
+        let trigger = visit.departureDate == .distantFuture ? "visit_arrival" : "visit_departure"
         Task { @MainActor in
-            self.onBackgroundWake?("visit")
+            self.onBackgroundWake?(trigger)
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didStartMonitoringFor region: CLRegion) {
+        // Ask whether we're already inside: iOS only reports crossings
+        manager.requestState(for: region)
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didDetermineState state: CLRegionState, for region: CLRegion) {
+        guard state != .unknown else { return }
+        Task { @MainActor in
+            self.onRegionState?(region.identifier, state == .inside)
         }
     }
 
@@ -328,11 +375,16 @@ extension LocationService: CLLocationManagerDelegate {
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         Task { @MainActor in
             self.authorizationStatus = manager.authorizationStatus
+            self.hasPreciseLocation = manager.accuracyAuthorization == .fullAccuracy
 
             switch manager.authorizationStatus {
             case .authorizedAlways:
                 self.startUpdatingLocation()
                 self.startBackgroundWakeups()
+                // Permission just upgraded: register the geofences we skipped
+                if !self.isMonitoring {
+                    self.refreshMonitoredRegions()
+                }
             case .authorizedWhenInUse:
                 self.startUpdatingLocation()
                 // Optionally request upgrade to Always (user can decline)

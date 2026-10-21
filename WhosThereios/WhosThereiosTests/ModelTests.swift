@@ -420,3 +420,121 @@ final class GroupBoundaryDistanceTests: XCTestCase {
         XCTAssertNil(group.isAt(location(latitude: 34.0004, longitude: -118.9995, accuracy: 500)))
     }
 }
+
+final class ZoneReadingTests: XCTestCase {
+
+    /// Same ~100m square as GroupBoundaryDistanceTests; top edge at 34.0009
+    private let group = LocationGroup(
+        id: "group1",
+        name: "Test",
+        isPublic: false,
+        ownerId: "owner",
+        boundary: [
+            Coordinate(latitude: 34.0000, longitude: -119.0000),
+            Coordinate(latitude: 34.0009, longitude: -119.0000),
+            Coordinate(latitude: 34.0009, longitude: -118.9989),
+            Coordinate(latitude: 34.0000, longitude: -118.9989)
+        ]
+    )
+
+    /// A fix `metersNorth` of the top edge
+    private func fix(metersNorth: Double, accuracy: Double) -> CLLocation {
+        CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: 34.0009 + metersNorth / 111_320, longitude: -118.9995),
+            altitude: 0,
+            horizontalAccuracy: accuracy,
+            verticalAccuracy: -1,
+            timestamp: Date()
+        )
+    }
+
+    func testWithinMarginIsInside() {
+        XCTAssertEqual(group.zoneReading(for: fix(metersNorth: 25, accuracy: 10)), .inside)
+    }
+
+    func testHysteresisBandIsNearby() {
+        // 50m out: past the 30m margin but not past 75m + 10m
+        XCTAssertEqual(group.zoneReading(for: fix(metersNorth: 50, accuracy: 10)), .nearby)
+    }
+
+    func testFarAwayIsOutside() {
+        XCTAssertEqual(group.zoneReading(for: fix(metersNorth: 100, accuracy: 10)), .outside)
+    }
+
+    func testPoorAccuracyWidensBothThresholds() {
+        // 100m out with a 40m fix: 75 + 40 = 115m needed to be clearly gone
+        XCTAssertEqual(group.zoneReading(for: fix(metersNorth: 100, accuracy: 40)), .nearby)
+    }
+
+    func testUselessFixIsUnknown() {
+        XCTAssertEqual(group.zoneReading(for: fix(metersNorth: 0, accuracy: 300)), .unknown)
+    }
+}
+
+final class AutoPresenceDeciderTests: XCTestCase {
+
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func decide(
+        _ reading: ZoneReading,
+        _ state: AutoPresenceState,
+        exitSignal: Bool = false
+    ) -> AutoPresenceAction {
+        AutoPresenceDecider.decide(reading: reading, state: state, hasExitSignal: exitSignal, now: now)
+    }
+
+    func testArrivingChecksIn() {
+        XCTAssertEqual(decide(.inside, AutoPresenceState()), .checkIn)
+    }
+
+    func testAlreadyInsideRecentlyWrittenDoesNothing() {
+        let state = AutoPresenceState(isAutoCheckedIn: true, lastWrite: now.addingTimeInterval(-60))
+        XCTAssertEqual(decide(.inside, state), .none)
+    }
+
+    func testAlreadyInsideLongAgoRefreshes() {
+        let state = AutoPresenceState(isAutoCheckedIn: true, lastWrite: now.addingTimeInterval(-15 * 60))
+        XCTAssertEqual(decide(.inside, state), .refresh)
+    }
+
+    func testManualCheckInIsTakenOverWhenInside() {
+        XCTAssertEqual(decide(.inside, AutoPresenceState(isManuallyCheckedIn: true)), .checkIn)
+    }
+
+    func testManualCheckOutBlocksAutoCheckInUntilLeaving() {
+        let suppressed = AutoPresenceState(isSuppressed: true)
+        XCTAssertEqual(decide(.inside, suppressed), .none)
+        XCTAssertEqual(decide(.nearby, suppressed), .none)
+        XCTAssertEqual(decide(.outside, suppressed), .clearSuppression)
+    }
+
+    func testNearbyNeverChangesAnything() {
+        XCTAssertEqual(decide(.nearby, AutoPresenceState()), .none)
+        XCTAssertEqual(decide(.nearby, AutoPresenceState(isAutoCheckedIn: true), exitSignal: true), .none)
+    }
+
+    func testSingleOutsideReadingWaits() {
+        let state = AutoPresenceState(isAutoCheckedIn: true, outsideSince: now)
+        XCTAssertEqual(decide(.outside, state), .none)
+    }
+
+    func testOutsideForTwoMinutesChecksOut() {
+        let state = AutoPresenceState(isAutoCheckedIn: true, outsideSince: now.addingTimeInterval(-121))
+        XCTAssertEqual(decide(.outside, state), .checkOut)
+    }
+
+    func testExitSignalPlusOutsideChecksOutImmediately() {
+        let state = AutoPresenceState(isAutoCheckedIn: true, outsideSince: now)
+        XCTAssertEqual(decide(.outside, state, exitSignal: true), .checkOut)
+    }
+
+    func testManualCheckInIsNeverAutoCheckedOut() {
+        let state = AutoPresenceState(isAutoCheckedIn: false, isManuallyCheckedIn: true, outsideSince: now.addingTimeInterval(-600))
+        XCTAssertEqual(decide(.outside, state, exitSignal: true), .none)
+    }
+
+    func testUnknownFixDoesNothing() {
+        XCTAssertEqual(decide(.unknown, AutoPresenceState()), .none)
+        XCTAssertEqual(decide(.unknown, AutoPresenceState(isAutoCheckedIn: true), exitSignal: true), .none)
+    }
+}
