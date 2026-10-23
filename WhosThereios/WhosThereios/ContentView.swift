@@ -9,6 +9,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var authService = AuthService()
+    @ObservedObject private var appVersionService = AppVersionService.shared
     @State private var hasCompletedOnboarding = UserDefaults.standard.bool(forKey: "hasCompletedOnboarding")
     @State private var showSplash = true
 
@@ -18,6 +19,8 @@ struct ContentView: View {
             Group {
                 if !hasCompletedOnboarding {
                     OnboardingView(hasCompletedOnboarding: $hasCompletedOnboarding)
+                } else if authService.isAuthenticated && authService.isNewUser {
+                    NameInputView(authService: authService)
                 } else if authService.isAuthenticated {
                     HomeView()
                 } else {
@@ -25,6 +28,7 @@ struct ContentView: View {
                 }
             }
             .animation(.easeInOut, value: authService.isAuthenticated)
+            .animation(.easeInOut, value: authService.isNewUser)
             .animation(.easeInOut, value: hasCompletedOnboarding)
 
             // Splash screen overlay
@@ -33,8 +37,18 @@ struct ContentView: View {
                     .transition(.opacity)
                     .zIndex(1)
             }
+
+            // Outdated version: block everything until they update
+            if appVersionService.isUpdateRequired {
+                UpdateRequiredView(message: appVersionService.updateMessage)
+                    .transition(.opacity)
+                    .zIndex(2)
+            }
         }
+        .animation(.easeInOut, value: appVersionService.isUpdateRequired)
         .onAppear {
+            appVersionService.startListening()
+
             // Show splash for 1.5 seconds
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 withAnimation(.easeOut(duration: 0.5)) {

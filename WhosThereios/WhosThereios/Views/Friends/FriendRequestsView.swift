@@ -13,6 +13,7 @@ struct FriendRequestsView: View {
 
     @State private var selectedTab = 0
     @State private var processingRequestIds: Set<String> = []
+    @State private var errorMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -40,6 +41,16 @@ struct FriendRequestsView: View {
                     Button("Done") {
                         dismiss()
                     }
+                }
+            }
+            .alert("Error", isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )) {
+                Button("OK") { errorMessage = nil }
+            } message: {
+                if let errorMessage {
+                    Text(errorMessage)
                 }
             }
         }
@@ -109,6 +120,7 @@ struct FriendRequestsView: View {
             HapticManager.success()
         } catch {
             HapticManager.error()
+            errorMessage = error.localizedDescription
         }
 
         processingRequestIds.remove(requestId)
@@ -123,6 +135,7 @@ struct FriendRequestsView: View {
             HapticManager.medium()
         } catch {
             HapticManager.error()
+            errorMessage = error.localizedDescription
         }
 
         processingRequestIds.remove(requestId)
@@ -137,6 +150,7 @@ struct FriendRequestsView: View {
             HapticManager.medium()
         } catch {
             HapticManager.error()
+            errorMessage = error.localizedDescription
         }
 
         processingRequestIds.remove(requestId)
@@ -195,6 +209,7 @@ struct ReceivedRequestRow: View {
                     .buttonStyle(.bordered)
                     .buttonBorderShape(.circle)
                     .tint(.red)
+                    .accessibilityLabel("Decline request from \(request.senderName)")
 
                     Button {
                         Task { await onAccept() }
@@ -205,6 +220,7 @@ struct ReceivedRequestRow: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .buttonBorderShape(.circle)
+                    .accessibilityLabel("Accept request from \(request.senderName)")
                 }
             }
         }

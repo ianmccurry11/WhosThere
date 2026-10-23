@@ -4,9 +4,14 @@
  * Handles push notifications for:
  * - Presence changes (arrivals/departures)
  * - New messages in group chat
+ *
+ * And presence upkeep:
+ * - Checking out lapsed presences every 10 minutes
+ * - Silent "re-check" pushes to phones that have gone quiet
  */
 
 import * as functions from "firebase-functions";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as admin from "firebase-admin";
 
 admin.initializeApp();
@@ -292,6 +297,247 @@ export const onNewMessage = functions.firestore
       console.error("Error sending message notification:", error);
       return null;
     }
+  });
+
+// ============================================
+// PRESENCE EXPIRY & RE-CHECK
+// ============================================
+//
+// Phones keep their check-in alive by rewriting `lastUpdated`/`expiresAt`
+// whenever iOS wakes the app. These functions make sure nobody stays
+// "here" forever when their phone goes quiet, and nudge quiet phones to
+// re-confirm with a silent push. Rules mirror Presence.isActive in the app.
+
+/** Same cap as Presence.maxAge in the app (5 hours) */
+const MAX_PRESENCE_AGE_MS = 5 * 60 * 60 * 1000;
+/** Scheduled sweep nudges automatic check-ins not confirmed for this long */
+const SCHEDULED_RECHECK_AFTER_MS = 25 * 60 * 1000;
+/** Opening a group nudges members not confirmed for this long */
+const ON_DEMAND_RECHECK_AFTER_MS = 10 * 60 * 1000;
+/** Never send a single check-in more than one re-check per this window */
+const RECHECK_COOLDOWN_MS = 10 * 60 * 1000;
+
+interface PresenceDoc {
+  userId: string;
+  isPresent: boolean;
+  isManual?: boolean;
+  lastUpdated?: admin.firestore.Timestamp;
+  expiresAt?: admin.firestore.Timestamp;
+  lastRecheckSentAt?: admin.firestore.Timestamp;
+}
+
+/**
+ * Whether a check-in should no longer count (mirrors Presence.isActive)
+ */
+function isLapsed(data: PresenceDoc, nowMs: number): boolean {
+  if (!data.isPresent) return false;
+  if (data.expiresAt && data.expiresAt.toMillis() <= nowMs) return true;
+  const updatedMs = data.lastUpdated?.toMillis() ?? 0;
+  return nowMs - updatedMs > MAX_PRESENCE_AGE_MS;
+}
+
+/**
+ * Whether a check-in is due for a silent "are you still there?" push
+ */
+function needsRecheck(
+  data: PresenceDoc,
+  nowMs: number,
+  confirmedWithinMs: number
+): boolean {
+  if (!data.isPresent || data.isManual || isLapsed(data, nowMs)) {
+    return false;
+  }
+  const updatedMs = data.lastUpdated?.toMillis() ?? 0;
+  const lastRecheckMs = data.lastRecheckSentAt?.toMillis() ?? 0;
+  return nowMs - updatedMs > confirmedWithinMs &&
+    nowMs - lastRecheckMs > RECHECK_COOLDOWN_MS;
+}
+
+/**
+ * True for docs at presence/{groupId}/members/{userId}
+ */
+function isPresenceMemberDoc(ref: admin.firestore.DocumentReference): boolean {
+  return ref.parent.parent?.parent.id === "presence";
+}
+
+/**
+ * Checks a presence out, re-reading it first so a heartbeat that landed
+ * after the query isn't overwritten. Fires onPresenceChange ("X left").
+ */
+async function checkOutIfLapsed(
+  ref: admin.firestore.DocumentReference
+): Promise<boolean> {
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const data = snap.data() as PresenceDoc | undefined;
+    if (!data || !isLapsed(data, Date.now())) return false;
+    tx.update(ref, {
+      isPresent: false,
+      expiresAt: admin.firestore.FieldValue.delete(),
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+      source: "server_expiry",
+    });
+    return true;
+  });
+}
+
+/**
+ * Sends one silent push per user asking their phone to re-confirm its
+ * check-ins, then stamps lastRecheckSentAt so we don't spam them.
+ */
+async function sendRechecks(
+  docs: admin.firestore.QueryDocumentSnapshot[]
+): Promise<void> {
+  if (docs.length === 0) return;
+
+  const docsByUser = new Map<string, admin.firestore.QueryDocumentSnapshot[]>();
+  for (const doc of docs) {
+    const userId = (doc.data() as PresenceDoc).userId;
+    docsByUser.set(userId, [...(docsByUser.get(userId) ?? []), doc]);
+  }
+
+  const tokens: string[] = [];
+  for (const userId of docsByUser.keys()) {
+    const userDoc = await db.collection("users").doc(userId).get();
+    const token = (userDoc.data() as User | undefined)?.fcmToken;
+    if (token) tokens.push(token);
+  }
+
+  if (tokens.length > 0) {
+    const messages: admin.messaging.Message[] = tokens.map((token) => ({
+      token,
+      data: { type: "presenceRecheck" },
+      apns: {
+        headers: {
+          "apns-push-type": "background",
+          "apns-priority": "5",
+        },
+        payload: { aps: { contentAvailable: true } },
+      },
+    }));
+    const response = await messaging.sendEach(messages);
+    console.log(
+      `Sent presence re-checks: ${response.successCount} success, ` +
+      `${response.failureCount} failures`
+    );
+    if (response.failureCount > 0) {
+      await cleanupInvalidTokens(tokens, response.responses);
+    }
+  }
+
+  const batch = db.batch();
+  for (const doc of docs) {
+    batch.update(doc.ref, {
+      lastRecheckSentAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+  await batch.commit();
+}
+
+/**
+ * Every 10 minutes: check out lapsed presences and nudge quiet phones.
+ * Replaces the old nightly cleanup, whose query had no index to run on.
+ */
+export const presenceSweep = onSchedule(
+  {
+    schedule: "every 10 minutes",
+    timeZone: "America/New_York",
+  },
+  async () => {
+    const nowMs = Date.now();
+    const now = admin.firestore.Timestamp.fromMillis(nowMs);
+    const members = db.collectionGroup("members");
+
+    // 1. Lapsed: past expiresAt, or not updated in 5 hours
+    const [expired, old] = await Promise.all([
+      members
+        .where("isPresent", "==", true)
+        .where("expiresAt", "<", now)
+        .get(),
+      members
+        .where("isPresent", "==", true)
+        .where(
+          "lastUpdated",
+          "<",
+          admin.firestore.Timestamp.fromMillis(nowMs - MAX_PRESENCE_AGE_MS)
+        )
+        .get(),
+    ]);
+
+    const lapsedRefs = new Map<string, admin.firestore.DocumentReference>();
+    for (const doc of [...expired.docs, ...old.docs]) {
+      if (isPresenceMemberDoc(doc.ref)) lapsedRefs.set(doc.ref.path, doc.ref);
+    }
+
+    let checkedOut = 0;
+    for (const ref of lapsedRefs.values()) {
+      try {
+        if (await checkOutIfLapsed(ref)) checkedOut++;
+      } catch (error) {
+        console.error("Error checking out lapsed presence:", ref.path, error);
+      }
+    }
+
+    // 2. Quiet: still active but not confirmed recently
+    const quiet = await members
+      .where("isPresent", "==", true)
+      .where(
+        "lastUpdated",
+        "<",
+        admin.firestore.Timestamp.fromMillis(nowMs - SCHEDULED_RECHECK_AFTER_MS)
+      )
+      .get();
+    const due = quiet.docs.filter((doc) =>
+      isPresenceMemberDoc(doc.ref) &&
+      !lapsedRefs.has(doc.ref.path) &&
+      needsRecheck(doc.data() as PresenceDoc, nowMs, SCHEDULED_RECHECK_AFTER_MS)
+    );
+    await sendRechecks(due);
+
+    console.log(
+      `Presence sweep: checked out ${checkedOut}, re-check sent for ${due.length}`
+    );
+  }
+);
+
+/**
+ * Someone opened a group: nudge members there whose phones have been quiet.
+ * The app writes presenceRecheckRequests/{groupId} (rate-limited per check-in
+ * by RECHECK_COOLDOWN_MS, so repeated opens can't spam anyone).
+ */
+export const onPresenceRecheckRequest = functions.firestore
+  .document("presenceRecheckRequests/{groupId}")
+  .onWrite(async (change, context) => {
+    const { groupId } = context.params;
+    const request = change.after.data() as { requestedBy?: string } | undefined;
+    const requestedBy = request?.requestedBy;
+    if (!requestedBy) return null;
+
+    // Only members (or anyone, for public groups) can trigger re-checks
+    const groupDoc = await db.collection("groups").doc(groupId).get();
+    const group = groupDoc.data() as
+      (LocationGroup & { isPublic?: boolean }) | undefined;
+    if (!group) return null;
+    if (!group.isPublic && !group.memberIds.includes(requestedBy)) {
+      console.log("Ignoring re-check request from non-member:", requestedBy);
+      return null;
+    }
+
+    const nowMs = Date.now();
+    const present = await db
+      .collection("presence")
+      .doc(groupId)
+      .collection("members")
+      .where("isPresent", "==", true)
+      .get();
+    const due = present.docs.filter((doc) => {
+      const data = doc.data() as PresenceDoc;
+      return data.userId !== requestedBy &&
+        needsRecheck(data, nowMs, ON_DEMAND_RECHECK_AFTER_MS);
+    });
+
+    await sendRechecks(due);
+    return null;
   });
 
 /**

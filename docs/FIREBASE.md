@@ -3,17 +3,34 @@
 ## Project Configuration
 
 **Project ID**: whostherefb
-**Bundle ID**: com.IanMcCurry.WhosThereios
+**iOS Bundle ID**: com.IanMcCurry.WhosThereios
+**Android Package Name**: com.whosthere.android
 
 ### Services Used
 
-- **Firebase Authentication**: Anonymous sign-in
-- **Cloud Firestore**: Main database
-- **Firebase Analytics**: Usage tracking (optional)
+- **Firebase Authentication**: Anonymous sign-in, Sign in with Apple, Sign in with Google (Android)
+- **Cloud Firestore**: Main database (shared between iOS and Android)
+- **Firebase Cloud Messaging (FCM)**: Push notifications
+- **Firebase App Check**: Bot/abuse prevention
+- **Firebase Analytics**: Usage tracking (optional, currently disabled)
 
 ### Configuration Files
 
-- `GoogleService-Info.plist` - Firebase SDK configuration (do not commit to public repos)
+| Platform | File | Notes |
+|----------|------|-------|
+| iOS | `GoogleService-Info.plist` | Add to Xcode project; never commit |
+| Android | `google-services.json` | Place in `app/`; never commit |
+
+Both files come from the **same Firebase project** (`whostherefb`). In the Firebase Console, iOS and Android apps are registered as separate entries under the same project.
+
+### Android Setup Steps
+
+1. Firebase Console → Project Settings → Add app → Android
+2. Package name: `com.whosthere.android`
+3. Register debug SHA-1 fingerprint (from `./gradlew signingReport`)
+4. Download `google-services.json` → place in `WhosThereAndroid/app/`
+5. Enable **Google Sign-In** in Firebase Auth → Sign-in method
+6. After building the Android app, add its SHA-256 fingerprint to `public/.well-known/assetlinks.json` for App Links deep link verification
 
 ---
 
@@ -139,212 +156,29 @@ firestore/
 
 ## Security Rules
 
-**File**: `firestore.rules`
+**Canonical file**: `firestore.rules` (project root) — this is what gets deployed. Do not maintain a separate copy here.
 
 ### Overview
 
 The security rules enforce:
-1. Users can only access their own user data
-2. Group access is based on membership and visibility
-3. Presence can only be modified by the user it belongs to
-4. Messages require group membership
-5. All writes are validated
+1. Users can only access their own user data (achievements, stats, notification prefs)
+2. Group reads are open to any authenticated user; writes are restricted by role
+3. Any authenticated user can join a public group or a private group with an invite code
+4. Presence can only be written by the user it belongs to
+5. Messages require group membership and are immutable after creation
+6. Reports can be created by any authenticated user but cannot be read except by the reporter
+7. All writes are validated server-side (field types, string lengths, coordinate ranges)
 
-### Complete Rules
+> See `firestore.rules` for the complete current rules.
+> See `FIRESTORE_SCHEMA.md` for the security rules summary table.
 
-```javascript
-rules_version = '2';
+### Deploying Rules
 
-service cloud.firestore {
-  match /databases/{database}/documents {
-
-    // ============================================
-    // HELPER FUNCTIONS
-    // ============================================
-
-    function isAuthenticated() {
-      return request.auth != null;
-    }
-
-    function userId() {
-      return request.auth.uid;
-    }
-
-    function isOwner(ownerId) {
-      return isAuthenticated() && userId() == ownerId;
-    }
-
-    function isValidString(field, minLen, maxLen) {
-      return field is string && field.size() >= minLen && field.size() <= maxLen;
-    }
-
-    function isValidLatitude(lat) {
-      return lat is number && lat >= -90 && lat <= 90;
-    }
-
-    function isValidLongitude(lng) {
-      return lng is number && lng >= -180 && lng <= 180;
-    }
-
-    // ============================================
-    // USERS COLLECTION
-    // ============================================
-
-    match /users/{userDocId} {
-      allow read: if isOwner(userDocId);
-
-      allow create: if isOwner(userDocId)
-        && isValidString(request.resource.data.displayName, 1, 50);
-
-      allow update: if isOwner(userDocId)
-        && isValidString(request.resource.data.displayName, 1, 50);
-
-      allow delete: if isOwner(userDocId);
-
-      // Achievements subcollection
-      match /achievements/{achievementId} {
-        allow read: if isOwner(userDocId);
-        allow create, update: if isOwner(userDocId)
-          && request.resource.data.userId == userId();
-        allow delete: if isOwner(userDocId);
-      }
-
-      // Stats subcollection
-      match /stats/{statId} {
-        allow read: if isOwner(userDocId);
-        allow create, update: if isOwner(userDocId);
-        allow delete: if isOwner(userDocId);
-      }
-    }
-
-    // ============================================
-    // GROUPS COLLECTION
-    // ============================================
-
-    match /groups/{groupId} {
-      function isMember() {
-        return isAuthenticated() && userId() in resource.data.memberIds;
-      }
-
-      function isGroupOwner() {
-        return isAuthenticated() && userId() == resource.data.ownerId;
-      }
-
-      function willBeMember() {
-        return isAuthenticated() && userId() in request.resource.data.memberIds;
-      }
-
-      function isValidGroupData() {
-        let data = request.resource.data;
-        return isValidString(data.name, 1, 100)
-          && data.isPublic is bool
-          && data.boundary is list
-          && data.boundary.size() >= 3
-          && data.boundary.size() <= 100
-          && isValidLatitude(data.centerLatitude)
-          && isValidLongitude(data.centerLongitude);
-      }
-
-      // Read: public groups or member
-      allow read: if isAuthenticated()
-        && (resource.data.isPublic == true || isMember());
-
-      // Create: set self as owner and member
-      allow create: if isAuthenticated()
-        && request.resource.data.ownerId == userId()
-        && userId() in request.resource.data.memberIds
-        && isValidGroupData();
-
-      // Update: owner or member (limited) or joining public
-      allow update: if isAuthenticated()
-        && (
-          (isGroupOwner() && request.resource.data.ownerId == resource.data.ownerId && isValidGroupData())
-          ||
-          (isMember()
-            && request.resource.data.name == resource.data.name
-            && request.resource.data.isPublic == resource.data.isPublic
-            && request.resource.data.ownerId == resource.data.ownerId
-            && request.resource.data.boundary == resource.data.boundary
-            && request.resource.data.centerLatitude == resource.data.centerLatitude
-            && request.resource.data.centerLongitude == resource.data.centerLongitude)
-          ||
-          (resource.data.isPublic == true
-            && willBeMember()
-            && request.resource.data.name == resource.data.name
-            && request.resource.data.isPublic == resource.data.isPublic
-            && request.resource.data.ownerId == resource.data.ownerId
-            && request.resource.data.boundary == resource.data.boundary)
-        );
-
-      // Delete: owner only
-      allow delete: if isGroupOwner();
-
-      // Messages subcollection
-      match /messages/{messageId} {
-        function isGroupMember() {
-          let groupDoc = get(/databases/$(database)/documents/groups/$(groupId));
-          return isAuthenticated() && userId() in groupDoc.data.memberIds;
-        }
-
-        function isValidMessage() {
-          let data = request.resource.data;
-          return isValidString(data.text, 1, 500)
-            && data.senderId == userId()
-            && isValidString(data.senderName, 1, 50)
-            && data.groupId == groupId
-            && data.createdAt is timestamp;
-        }
-
-        allow read: if isGroupMember();
-        allow create: if isGroupMember() && isValidMessage();
-        allow delete: if isAuthenticated() && resource.data.senderId == userId();
-        allow update: if false;
-      }
-
-      // Daily first arrival (for Early Bird achievement)
-      match /daily_first_arrival/{dateId} {
-        function isGroupMemberForArrival() {
-          let groupDoc = get(/databases/$(database)/documents/groups/$(groupId));
-          return isAuthenticated() && userId() in groupDoc.data.memberIds;
-        }
-
-        allow read: if isGroupMemberForArrival();
-        allow create: if isGroupMemberForArrival()
-          && request.resource.data.userId == userId();
-        allow update, delete: if false;
-      }
-    }
-
-    // ============================================
-    // PRESENCE COLLECTION
-    // ============================================
-
-    match /presence/{groupId} {
-      allow read: if isAuthenticated();
-
-      match /members/{memberId} {
-        allow read: if isAuthenticated();
-
-        allow create, update: if isOwner(memberId)
-          && request.resource.data.userId == userId()
-          && request.resource.data.groupId == groupId
-          && request.resource.data.isPresent is bool
-          && request.resource.data.isManual is bool;
-
-        allow delete: if isOwner(memberId);
-      }
-    }
-
-    // ============================================
-    // DEFAULT: DENY ALL
-    // ============================================
-
-    match /{document=**} {
-      allow read, write: if false;
-    }
-  }
-}
+```bash
+firebase deploy --only firestore:rules
 ```
+
+> **Note**: Rules are platform-agnostic. The same rules govern both iOS and Android clients since Firebase Auth UIDs are consistent across platforms.
 
 ---
 

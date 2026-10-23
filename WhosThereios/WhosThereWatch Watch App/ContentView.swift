@@ -96,8 +96,7 @@ struct NearbyGroupRow: View {
         Button(action: onToggle) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text(group.emoji)
-                        .font(.title2)
+                    GroupIconView(icon: group.emoji, size: 28)
 
                     Text(group.name)
                         .font(.headline)
@@ -146,9 +145,8 @@ struct GroupRow: View {
     var body: some View {
         Button(action: onToggle) {
             HStack {
-                // Emoji
-                Text(group.emoji)
-                    .font(.title3)
+                // Icon
+                GroupIconView(icon: group.emoji, size: 22)
 
                 // Name and status
                 VStack(alignment: .leading, spacing: 2) {

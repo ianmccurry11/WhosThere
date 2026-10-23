@@ -52,12 +52,13 @@ struct GroupSettingsView: View {
                         Button {
                             showEmojiPicker = true
                         } label: {
-                            Text(selectedEmoji)
-                                .font(.largeTitle)
+                            GroupIconView(icon: selectedEmoji, size: 34)
                                 .padding(8)
                                 .background(Color(.systemGray5))
                                 .cornerRadius(8)
                         }
+                        .accessibilityLabel("Group icon: \(selectedEmoji)")
+                        .accessibilityHint("Tap to change icon")
                     }
 
                     // Name editor with softer styling
@@ -88,6 +89,7 @@ struct GroupSettingsView: View {
                         .frame(height: 150)
                         .cornerRadius(8)
                         .allowsHitTesting(false)
+                        .accessibilityLabel("Map showing group boundary with \(boundaryPoints.count) points")
                     }
 
                     Button {
@@ -193,6 +195,7 @@ struct GroupSettingsView: View {
             }
             .task {
                 await loadNotificationPreferences()
+                await AchievementService.shared.recordGroupSettingsViewed()
             }
         }
     }
@@ -503,6 +506,9 @@ struct BoundaryMarkerView: View {
                 showDeleteButton = false
             }
         }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Boundary point \(index + 1)\(isSelected ? ", selected" : "")")
+        .accessibilityHint(isSelected ? "Tap to deselect. Long press to delete." : "Tap to select. Long press to delete.")
     }
 }
 
@@ -531,27 +537,67 @@ struct EmojiPickerView: View {
     ]
 
     let columns = [
-        GridItem(.adaptive(minimum: 44))
+        GridItem(.adaptive(minimum: 50), spacing: 8)
     ]
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                LazyVGrid(columns: columns, spacing: 12) {
-                    ForEach(commonEmojis, id: \.self) { emoji in
-                        Button {
-                            selectedEmoji = emoji
-                            dismiss()
-                        } label: {
-                            Text(emoji)
-                                .font(.largeTitle)
-                                .frame(width: 50, height: 50)
-                                .background(selectedEmoji == emoji ? Color.blue.opacity(0.2) : Color.clear)
-                                .cornerRadius(8)
+                VStack(alignment: .leading, spacing: 16) {
+                    // Custom Icons Section
+                    if !GroupIcon.customIcons.isEmpty {
+                        Text("Custom Icons")
+                            .font(.headline)
+                            .padding(.horizontal)
+
+                        LazyVGrid(columns: columns, spacing: 12) {
+                            ForEach(GroupIcon.customIcons) { icon in
+                                Button {
+                                    selectedEmoji = icon.assetName
+                                    dismiss()
+                                } label: {
+                                    Image(icon.assetName)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(width: 36, height: 36)
+                                        .frame(width: 44, height: 44)
+                                        .background(selectedEmoji == icon.assetName ? Color.blue.opacity(0.2) : Color.clear)
+                                        .cornerRadius(8)
+                                }
+                                .accessibilityLabel(icon.displayName)
+                                .accessibilityAddTraits(selectedEmoji == icon.assetName ? .isSelected : [])
+                            }
+                        }
+                        .padding(.horizontal)
+
+                        Divider()
+                            .padding(.horizontal)
+                    }
+
+                    // Emojis Section
+                    Text("Emojis")
+                        .font(.headline)
+                        .padding(.horizontal)
+
+                    LazyVGrid(columns: columns, spacing: 12) {
+                        ForEach(commonEmojis, id: \.self) { emoji in
+                            Button {
+                                selectedEmoji = emoji
+                                dismiss()
+                            } label: {
+                                Text(emoji)
+                                    .font(.title2)
+                                    .frame(width: 44, height: 44)
+                                    .background(selectedEmoji == emoji ? Color.blue.opacity(0.2) : Color.clear)
+                                    .cornerRadius(8)
+                            }
+                            .accessibilityLabel(emoji)
+                            .accessibilityAddTraits(selectedEmoji == emoji ? .isSelected : [])
                         }
                     }
+                    .padding(.horizontal)
                 }
-                .padding()
+                .padding(.vertical)
             }
             .navigationTitle("Choose Icon")
             .navigationBarTitleDisplayMode(.inline)

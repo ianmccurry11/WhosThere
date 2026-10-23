@@ -49,6 +49,12 @@ enum AppError: LocalizedError {
     case requestTimeout
     case serverError(underlying: Error?)
 
+    // MARK: - Store Errors
+    case purchaseFailed(underlying: Error?)
+    case purchaseCancelled
+    case purchasePending
+    case restoreFailed(underlying: Error?)
+
     // MARK: - Validation Errors
     case validationFailed(field: String, reason: String)
 
@@ -122,6 +128,16 @@ enum AppError: LocalizedError {
         case .serverError(let error):
             return "Server error: \(error?.localizedDescription ?? "Unknown error")"
 
+        // Store
+        case .purchaseFailed(let error):
+            return "Purchase failed: \(error?.localizedDescription ?? "Unknown error")"
+        case .purchaseCancelled:
+            return "Purchase was cancelled."
+        case .purchasePending:
+            return "Purchase is pending approval."
+        case .restoreFailed(let error):
+            return "Failed to restore purchases: \(error?.localizedDescription ?? "Unknown error")"
+
         // Validation
         case .validationFailed(let field, let reason):
             return "Invalid \(field): \(reason)"
@@ -187,6 +203,14 @@ enum AppError: LocalizedError {
             return "Failed to delete group"
         case .alreadyGroupMember:
             return "Already a member"
+        case .purchaseFailed:
+            return "Purchase failed"
+        case .purchaseCancelled:
+            return "Purchase cancelled"
+        case .purchasePending:
+            return "Purchase pending approval"
+        case .restoreFailed:
+            return "Restore failed"
         default:
             return "Something went wrong"
         }
@@ -195,7 +219,7 @@ enum AppError: LocalizedError {
     /// Whether this error should be logged for debugging
     var shouldLog: Bool {
         switch self {
-        case .notAuthenticated, .locationPermissionDenied, .locationPermissionRestricted:
+        case .notAuthenticated, .locationPermissionDenied, .locationPermissionRestricted, .purchaseCancelled:
             return false // Expected user states, not errors
         default:
             return true

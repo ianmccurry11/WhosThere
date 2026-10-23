@@ -1,0 +1,14 @@
+{
+  "applinks": {
+    "apps": [],
+    "details": [
+      {
+        "appID": "CW89HNQWR4.com.IanMcCurry.WhosThereios",
+        "paths": [
+          "/join/*",
+          "/group/*"
+        ]
+      }
+    ]
+  }
+}

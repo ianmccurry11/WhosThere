@@ -59,7 +59,7 @@ class WatchConnectivityService: NSObject {
             let data = try JSONSerialization.data(withJSONObject: watchGroups)
             try session.updateApplicationContext(["groups": data])
         } catch {
-            print("Error sending groups to watch: \(error)")
+            AppLogger.debug("Error sending groups to watch: \(error)")
         }
     }
 
@@ -78,7 +78,7 @@ class WatchConnectivityService: NSObject {
         ]
 
         session.sendMessage(message, replyHandler: nil) { error in
-            print("Error sending presence update: \(error)")
+            AppLogger.debug("Error sending presence update: \(error)")
         }
     }
 }

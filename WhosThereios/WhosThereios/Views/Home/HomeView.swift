@@ -15,13 +15,23 @@ struct HomeView: View {
     @ObservedObject private var achievementService = AchievementService.shared
     @ObservedObject private var networkMonitor = NetworkMonitor.shared
     @ObservedObject private var friendService = FriendService.shared
+    @ObservedObject private var deepLinkService = DeepLinkService.shared
+    @ObservedObject private var levelService = LevelService.shared
     @StateObject private var authService = AuthService()
 
+    @Environment(\.scenePhase) private var scenePhase
     @State private var selectedTab = 0
     @State private var showCreateGroup = false
     @State private var showProfile = false
+    @State private var showProfileForNameEdit = false
     @State private var showFriendsList = false
     @State private var showConfetti = false
+    @State private var notificationGroup: LocationGroup?
+    @State private var deepLinkPreviewGroup: LocationGroup?
+    @State private var dismissedNameBanner = false
+    @State private var showLocationSetup = false
+    /// The location setup sheet opens by itself only once; after that the banner offers it
+    @AppStorage("hasShownLocationSetup") private var hasShownLocationSetup = false
 
     var body: some View {
         NavigationStack {
@@ -31,6 +41,50 @@ struct HomeView: View {
                     if !networkMonitor.isConnected {
                         StatusBanner(message: "No internet connection", type: .offline)
                             .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+
+                    // Location settings that stop automatic check-in from working
+                    if let warning = locationSettingsWarning {
+                        StatusBanner(
+                            message: warning,
+                            type: .warning,
+                            action: { showLocationSetup = true },
+                            actionLabel: "Fix"
+                        )
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+
+                    // Name nudge banner
+                    if showNameNudge {
+                        HStack(spacing: 12) {
+                            Image(systemName: "person.text.rectangle")
+                                .font(.body)
+
+                            Text("Set your name so friends can find you")
+                                .font(.subheadline)
+
+                            Spacer()
+
+                            Button("Set Name") {
+                                showProfileForNameEdit = true
+                            }
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+
+                            Button {
+                                withAnimation {
+                                    dismissedNameBanner = true
+                                }
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.caption)
+                            }
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(Color.appBlue)
+                        .transition(.move(edge: .top).combined(with: .opacity))
                     }
 
                     TabView(selection: $selectedTab) {
@@ -43,6 +97,7 @@ struct HomeView: View {
                     .tabViewStyle(.page(indexDisplayMode: .never))
                 }
                 .animation(.easeInOut(duration: 0.3), value: networkMonitor.isConnected)
+                .animation(.easeInOut(duration: 0.3), value: showNameNudge)
 
                 // Custom Tab Bar
                 CustomTabBar(
@@ -63,6 +118,17 @@ struct HomeView: View {
                     .onAppear {
                         showConfetti = true
                     }
+                }
+
+                // Level-up toast
+                if let newLevel = levelService.newlyReachedLevel {
+                    VStack {
+                        LevelUpToast(level: newLevel)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                            .padding(.top, networkMonitor.isConnected ? 60 : 100)
+                        Spacer()
+                    }
+                    .animation(.spring(response: 0.5, dampingFraction: 0.8), value: levelService.newlyReachedLevel)
                 }
             }
             .confetti(isActive: $showConfetti)
@@ -86,16 +152,21 @@ struct HomeView: View {
                             }
                         }
                     }
+                    .accessibilityLabel("Friends")
+                    .accessibilityHint(friendService.pendingRequests.isEmpty ? "View your friends list" : "\(friendService.pendingRequests.count) pending friend requests")
                 }
                 ToolbarItem(placement: .principal) {
                     Text("Who's There")
                         .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button(action: { showProfile = true }) {
                         Image(systemName: "person.circle")
                             .font(.title3)
                     }
+                    .accessibilityLabel("Profile")
+                    .accessibilityHint("View your profile and settings")
                 }
             }
         }
@@ -110,15 +181,110 @@ struct HomeView: View {
         .sheet(isPresented: $showProfile) {
             ProfileView(authService: authService)
         }
+        .sheet(isPresented: $showProfileForNameEdit) {
+            ProfileView(authService: authService, startEditingName: true)
+        }
         .sheet(isPresented: $showFriendsList) {
             FriendsListView()
+        }
+        .sheet(item: $notificationGroup) { group in
+            GroupDetailView(group: group)
         }
         .task {
             await initializeData()
         }
         .onAppear {
-            locationService.requestAuthorization()
+            if needsLocationSetup && !hasShownLocationSetup {
+                // Explain why before iOS asks, instead of a bare permission prompt
+                hasShownLocationSetup = true
+                showLocationSetup = true
+            } else if locationService.authorizationStatus == .notDetermined {
+                locationService.requestAuthorization()
+            }
         }
+        .sheet(isPresented: $showLocationSetup) {
+            LocationSetupView()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openGroup)) { notification in
+            if let groupId = notification.userInfo?["groupId"] as? String {
+                Task {
+                    if let group = await firestoreService.fetchGroupById(groupId) {
+                        notificationGroup = group
+                    }
+                }
+            }
+        }
+        .onChange(of: deepLinkService.pendingGroupId) { _, groupId in
+            guard let groupId else { return }
+            deepLinkService.pendingGroupId = nil
+            Task {
+                if let group = await firestoreService.fetchGroupById(groupId) {
+                    deepLinkPreviewGroup = group
+                }
+            }
+        }
+        .onChange(of: deepLinkService.pendingInviteCode) { _, code in
+            guard let code else { return }
+            deepLinkService.pendingInviteCode = nil
+            Task {
+                if let group = await firestoreService.findGroupByInviteCode(code) {
+                    deepLinkPreviewGroup = group
+                }
+            }
+        }
+        .sheet(item: $deepLinkPreviewGroup) { group in
+            GroupPreviewSheet(
+                group: group,
+                onJoin: {
+                    if let groupId = group.id {
+                        _ = await firestoreService.joinGroup(groupId: groupId)
+                        await firestoreService.fetchJoinedGroups()
+                    }
+                },
+                onOpen: {
+                    notificationGroup = group
+                }
+            )
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            switch newPhase {
+            case .active:
+                Task {
+                    await presenceService.checkExpiredTimersOnForeground()
+                }
+                presenceService.startHeartbeat()
+            case .background:
+                presenceService.stopHeartbeat()
+            default:
+                break
+            }
+        }
+    }
+
+    /// Why automatic check-in can't work on this phone, if it can't
+    private var locationSettingsWarning: String? {
+        switch locationService.authorizationStatus {
+        case .authorizedAlways:
+            return locationService.hasPreciseLocation
+                ? nil
+                : "Turn on Precise Location so you're checked in at the right place"
+        case .authorizedWhenInUse:
+            return "Set location to \"Always\" to be checked in without opening the app"
+        default:
+            // Denied is covered by the map's own overlay; not asked yet needs no nag
+            return nil
+        }
+    }
+
+    /// Automatic check-in needs "Always" and Precise Location
+    private var needsLocationSetup: Bool {
+        locationService.authorizationStatus != .authorizedAlways || !locationService.hasPreciseLocation
+    }
+
+    private var showNameNudge: Bool {
+        guard !dismissedNameBanner,
+              let user = firestoreService.currentUser else { return false }
+        return user.hasDefaultName
     }
 
     private func initializeData() async {
@@ -133,12 +299,15 @@ struct HomeView: View {
 
         presenceService.startMonitoring(groups: firestoreService.joinedGroups)
 
-        // Load achievements
+        // Load achievements and level data
         await achievementService.loadUserData()
+
+        // Check and award daily login XP
+        await levelService.checkAndAwardDailyLoginXP()
     }
 
     private func refreshData() async {
-        print("refreshData() called")
+        AppLogger.debug("refreshData() called")
         await firestoreService.fetchJoinedGroups()
 
         if let location = locationService.currentLocation {
@@ -148,7 +317,7 @@ struct HomeView: View {
         }
 
         presenceService.startMonitoring(groups: firestoreService.joinedGroups)
-        print("refreshData() finished - joinedGroups: \(firestoreService.joinedGroups.count)")
+        AppLogger.debug("refreshData() finished - joinedGroups: \(firestoreService.joinedGroups.count)")
     }
 }
 
@@ -169,25 +338,27 @@ struct CustomTabBar: View {
                 selectedTab = 0
             }
 
-            // Create Button
+            // Create Button — bold CTA color
             Button(action: {
                 HapticManager.medium()
                 onCreateTapped()
             }) {
                 ZStack {
                     Circle()
-                        .fill(Color.appBrown)
+                        .fill(Color.appCoral)
                         .frame(width: 56, height: 56)
-                        .shadow(color: .appBrown.opacity(0.3), radius: 8, y: 4)
+                        .shadow(color: .appCoral.opacity(0.4), radius: 10, y: 4)
 
                     Image(systemName: "plus")
                         .font(.system(size: 24, weight: .semibold))
-                        .foregroundColor(.appCream)
+                        .foregroundColor(.white)
                         .rotationEffect(.degrees(createButtonPressed ? 90 : 0))
                 }
                 .scaleEffect(createButtonPressed ? 0.9 : 1.0)
                 .animation(.spring(response: 0.3, dampingFraction: 0.6), value: createButtonPressed)
             }
+            .accessibilityLabel("Create Group")
+            .accessibilityHint("Create a new location group")
             .offset(y: -20)
             .onLongPressGesture(minimumDuration: .infinity, pressing: { pressing in
                 createButtonPressed = pressing
@@ -208,7 +379,7 @@ struct CustomTabBar: View {
         .background(
             RoundedRectangle(cornerRadius: 24)
                 .fill(.ultraThinMaterial)
-                .shadow(color: .black.opacity(0.1), radius: 10, y: -5)
+                .shadow(color: .appShadow, radius: 10, y: -5)
         )
     }
 }
@@ -231,9 +402,11 @@ struct TabBarButton: View {
                 Text(label)
                     .font(.caption2)
             }
-            .foregroundColor(isSelected ? .appBrown : .gray)
+            .foregroundColor(isSelected ? .appBlue : .gray)
             .frame(maxWidth: .infinity)
             .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isSelected)
+            .accessibilityLabel("\(label) tab")
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
         }
     }
 }

@@ -269,8 +269,8 @@ Checks if user is currently inside group boundary.
 
 - Uses circular regions (CLCircularRegion) for geofencing
 - Calculates radius from maximum boundary point distance + 10% buffer
-- iOS limit: 20 monitored regions max
-- Sorts groups by distance, monitors nearest 20
+- **iOS limit: 20 monitored regions max** — this is an Apple platform constraint, not a design choice. Android (GeofencingClient) supports up to 100 geofences and does not have this restriction.
+- Sorts groups by distance, monitors nearest 20 (due to iOS limit)
 
 ---
 
@@ -415,6 +415,8 @@ if !networkMonitor.isConnected {
 ---
 
 ## WatchConnectivityService
+
+> **iOS/watchOS only** — This service has no Android equivalent. The Android app does not support a companion wearable in V1.
 
 **File**: `Services/WatchConnectivityService.swift`
 

@@ -16,6 +16,7 @@ enum PresenceDisplayMode: String, Codable {
 }
 
 enum GroupColor: String, Codable, CaseIterable {
+    // Free colors
     case blue = "blue"
     case green = "green"
     case red = "red"
@@ -24,6 +25,14 @@ enum GroupColor: String, Codable, CaseIterable {
     case pink = "pink"
     case teal = "teal"
     case yellow = "yellow"
+
+    // Premium colors
+    case gold = "gold"
+    case indigo = "indigo"
+    case mint = "mint"
+    case lavender = "lavender"
+    case coral = "coral"
+    case slate = "slate"
 
     var color: Color {
         switch self {
@@ -35,12 +44,19 @@ enum GroupColor: String, Codable, CaseIterable {
         case .pink: return .pink
         case .teal: return .teal
         case .yellow: return .yellow
+        case .gold: return Color(red: 1.0, green: 0.84, blue: 0.0)
+        case .indigo: return .indigo
+        case .mint: return .mint
+        case .lavender: return Color(red: 0.71, green: 0.49, blue: 0.86)
+        case .coral: return Color(red: 1.0, green: 0.50, blue: 0.31)
+        case .slate: return Color(red: 0.44, green: 0.50, blue: 0.56)
         }
     }
 
     var displayName: String {
         rawValue.capitalized
     }
+
 }
 
 struct Coordinate: Codable, Equatable {
@@ -168,5 +184,74 @@ struct LocationGroup: Identifiable, Codable {
         }
 
         return isInside
+    }
+}
+
+// MARK: - Distance to Boundary
+
+extension LocationGroup {
+    /// Meters from a coordinate to the nearest edge of the group's boundary,
+    /// or 0 when the coordinate is inside. Lets presence checks allow a margin
+    /// for GPS error instead of requiring the fix to land exactly in the box.
+    func distanceToBoundary(from coordinate: CLLocationCoordinate2D) -> CLLocationDistance {
+        guard boundary.count >= 3 else { return .infinity }
+        if contains(coordinate: coordinate) { return 0 }
+
+        // Flatten to local meters around the point; accurate at group scale
+        let metersPerDegreeLatitude = 111_320.0
+        let metersPerDegreeLongitude = metersPerDegreeLatitude * cos(coordinate.latitude * .pi / 180)
+        let points = boundary.map { vertex in
+            (x: (vertex.longitude - coordinate.longitude) * metersPerDegreeLongitude,
+             y: (vertex.latitude - coordinate.latitude) * metersPerDegreeLatitude)
+        }
+
+        var nearest = CLLocationDistance.infinity
+        for index in points.indices {
+            let start = points[index]
+            let end = points[(index + 1) % points.count]
+            nearest = min(nearest, Self.distanceFromOrigin(toSegmentFrom: start, to: end))
+        }
+        return nearest
+    }
+
+    /// Where a location fix puts the user relative to this group, allowing for
+    /// GPS error: within max(30m, accuracy) counts as inside; beyond
+    /// 75m + accuracy is clearly outside; in between is "nearby".
+    func zoneReading(for location: CLLocation) -> ZoneReading {
+        let accuracy = location.horizontalAccuracy
+        guard accuracy >= 0, accuracy <= PresencePolicy.maxUsableAccuracy else { return .unknown }
+
+        let distance = distanceToBoundary(from: location.coordinate)
+        if distance <= max(PresencePolicy.confirmMargin, accuracy) {
+            return .inside
+        }
+        if distance > PresencePolicy.exitMargin + accuracy {
+            return .outside
+        }
+        return .nearby
+    }
+
+    /// Whether a location fix puts the user at this group, or nil when the fix
+    /// is too inaccurate to say either way.
+    func isAt(_ location: CLLocation) -> Bool? {
+        switch zoneReading(for: location) {
+        case .unknown: return nil
+        case .inside: return true
+        case .nearby, .outside: return false
+        }
+    }
+
+    private static func distanceFromOrigin(
+        toSegmentFrom start: (x: Double, y: Double),
+        to end: (x: Double, y: Double)
+    ) -> Double {
+        let segmentX = end.x - start.x
+        let segmentY = end.y - start.y
+        let lengthSquared = segmentX * segmentX + segmentY * segmentY
+        guard lengthSquared > 0 else { return hypot(start.x, start.y) }
+
+        // Project the origin onto the segment, clamped to its endpoints
+        let projection = max(0, min(1, -(start.x * segmentX + start.y * segmentY) / lengthSquared))
+        return hypot(start.x + projection * segmentX, start.y + projection * segmentY)
     }
 }

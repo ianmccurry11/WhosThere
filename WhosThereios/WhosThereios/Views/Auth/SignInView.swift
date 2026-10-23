@@ -14,9 +14,9 @@ struct SignInView: View {
 
     var body: some View {
         ZStack {
-            // Background gradient with new color palette
+            // Background gradient
             LinearGradient(
-                gradient: Gradient(colors: [Color.appDarkGreen, Color.appOliveGreen]),
+                gradient: Gradient(colors: [Color.appNavy, Color.appBlue]),
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
@@ -30,6 +30,7 @@ struct SignInView: View {
                     Image(systemName: "mappin.circle.fill")
                         .font(.system(size: 80))
                         .foregroundColor(.white)
+                        .accessibilityHidden(true)
 
                     Text("Who's There")
                         .font(.system(size: 42, weight: .bold))
@@ -58,8 +59,8 @@ struct SignInView: View {
                     // Sign in with Apple
                     SignInWithAppleButton(
                         onRequest: { request in
-                            request.requestedScopes = [.fullName, .email]
                             let appleRequest = authService.startSignInWithAppleFlow()
+                            request.requestedScopes = appleRequest.requestedScopes
                             request.nonce = appleRequest.nonce
                         },
                         onCompletion: { result in
@@ -110,11 +111,13 @@ struct FeatureRow: View {
                 .font(.title2)
                 .foregroundColor(.white)
                 .frame(width: 30)
+                .accessibilityHidden(true)
 
             Text(text)
                 .font(.body)
                 .foregroundColor(.white)
         }
+        .accessibilityElement(children: .combine)
     }
 }
 

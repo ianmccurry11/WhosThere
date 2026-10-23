@@ -106,13 +106,16 @@ struct PointsSummaryCard: View {
                 }
             }
             .frame(height: 8)
+            .accessibilityLabel("Achievement progress: \(earnedCount) of \(totalCount) badges earned")
         }
         .padding()
         .background(
             RoundedRectangle(cornerRadius: 16)
                 .fill(Color(.systemBackground))
-                .shadow(color: .black.opacity(0.1), radius: 10, y: 4)
+                .shadow(color: .appShadow, radius: 10, y: 4)
         )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(totalPoints) total points. \(earnedCount) of \(totalCount) badges earned.")
     }
 
     private var progressPercentage: CGFloat {
@@ -168,6 +171,8 @@ struct FilterChip: View {
                         .fill(isSelected ? Color.blue : Color(.systemGray5))
                 )
         }
+        .accessibilityLabel("\(title) filter")
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 }
 
@@ -265,12 +270,25 @@ struct AchievementCard: View {
         .background(
             RoundedRectangle(cornerRadius: 12)
                 .fill(Color(.systemBackground))
-                .shadow(color: .black.opacity(0.05), radius: 5, y: 2)
+                .shadow(color: .appShadow.opacity(0.5), radius: 5, y: 2)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12)
                 .stroke(isEarned ? Color.blue.opacity(0.3) : Color.clear, lineWidth: 2)
         )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(achievementAccessibilityLabel)
+        .accessibilityHint("Tap for details")
+    }
+
+    private var achievementAccessibilityLabel: String {
+        if isEarned {
+            return "\(achievement.displayName), earned, plus \(achievement.points) points"
+        } else if let progress = progress {
+            return "\(achievement.displayName), \(progress.current) of \(progress.target) progress"
+        } else {
+            return "\(achievement.displayName), locked"
+        }
     }
 }
 
@@ -303,9 +321,12 @@ struct AchievementUnlockedToast: View {
         .background(
             RoundedRectangle(cornerRadius: 16)
                 .fill(Color(.systemBackground))
-                .shadow(color: .black.opacity(0.2), radius: 20, y: 10)
+                .shadow(color: .appShadow, radius: 20, y: 10)
         )
         .padding(.horizontal)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Achievement unlocked: \(achievement.displayName), plus \(achievement.points) points")
+        .accessibilityAddTraits(.isStaticText)
     }
 }
 
@@ -458,7 +479,7 @@ struct RecentAchievementsRow: View {
         .background(
             RoundedRectangle(cornerRadius: 12)
                 .fill(Color(.systemBackground))
-                .shadow(color: .black.opacity(0.05), radius: 5, y: 2)
+                .shadow(color: .appShadow.opacity(0.5), radius: 5, y: 2)
         )
     }
 }

@@ -14,19 +14,59 @@ struct GroupDetailView: View {
     @ObservedObject private var locationService = LocationService.shared
     @ObservedObject private var firestoreService = FirestoreService.shared
     @ObservedObject private var presenceService = PresenceService.shared
+    @ObservedObject private var networkMonitor = NetworkMonitor.shared
+    @ObservedObject private var friendService = FriendService.shared
 
     let group: LocationGroup
 
-    @State private var presences: [Presence] = []
     @State private var isJoined = false
     @State private var isOwner = false
-    @State private var isPresent = false
     @State private var showSettings = false
     @State private var showLeaveConfirmation = false
     @State private var showDeleteConfirmation = false
     @State private var copiedInviteCode = false
     @State private var mapPosition: MapCameraPosition = .automatic
     @State private var mapId = UUID()  // Force map to re-render if needed
+    @State private var reportingPresence: Presence?
+    @State private var profilePresence: Presence?
+    @State private var friendRequestAlertMessage: String?
+    @State private var showFriendRequestAlert = false
+
+    /// Everyone here right now — the same live data the map bubble uses
+    private var presences: [Presence] {
+        guard let groupId = group.id else { return [] }
+        return presenceService.presenceByGroup[groupId]?.presentMembers ?? []
+    }
+
+    private var isPresent: Bool {
+        guard let userId = Auth.auth().currentUser?.uid else { return false }
+        return presences.contains { $0.userId == userId }
+    }
+
+    /// Checking out always works; checking in only near the group
+    private var canTogglePresence: Bool {
+        isPresent || presenceService.manualCheckInAvailability(for: group) == .allowed
+    }
+
+    private var checkInButtonColor: Color {
+        if isPresent { return .green }
+        return canTogglePresence ? .blue : .gray
+    }
+
+    /// Why Check In is disabled, or nil when it isn't
+    private var checkInUnavailableReason: String? {
+        guard !isPresent else { return nil }
+        switch presenceService.manualCheckInAvailability(for: group) {
+        case .allowed:
+            return nil
+        case .noLocation:
+            return "Finding your location…"
+        case .tooFar(let meters):
+            let distance = Measurement(value: meters, unit: UnitLength.meters)
+                .formatted(.measurement(width: .abbreviated, usage: .road))
+            return "You need to be at \(group.name) to check in (\(distance) away)"
+        }
+    }
 
     /// Check if the group has valid coordinates for display
     private var hasValidCoordinates: Bool {
@@ -42,6 +82,11 @@ struct GroupDetailView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 0) {
+                    // Offline banner
+                    if !networkMonitor.isConnected {
+                        StatusBanner(message: "You're offline. Some actions may not work.", type: .offline)
+                    }
+
                     // Map with boundary - only show if valid coordinates
                     if hasValidCoordinates {
                         Map(position: $mapPosition) {
@@ -63,6 +108,7 @@ struct GroupDetailView: View {
                         .id(mapId)  // Force re-render when needed
                         .frame(height: 200)
                         .allowsHitTesting(false)
+                        .accessibilityLabel("Map showing \(group.name) boundary")
                         .onAppear {
                             // Set camera to show the group's boundary
                             let span = MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
@@ -73,16 +119,21 @@ struct GroupDetailView: View {
                         // Fallback when coordinates are invalid
                         ZStack {
                             Color(.systemGray5)
-                            VStack {
+                            VStack(spacing: 8) {
                                 Image(systemName: "map")
                                     .font(.largeTitle)
                                     .foregroundColor(.secondary)
                                 Text("Map unavailable")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
+                                Text("This group's location hasn't been set up yet.")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
                             }
                         }
                         .frame(height: 200)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Map unavailable. This group's location hasn't been set up yet.")
                     }
 
                     VStack(spacing: 20) {
@@ -90,8 +141,7 @@ struct GroupDetailView: View {
                         VStack(spacing: 12) {
                             HStack {
                                 // Emoji icon
-                                Text(group.displayEmoji)
-                                    .font(.system(size: 40))
+                                GroupIconView(icon: group.displayEmoji, size: 40)
                                     .padding(.trailing, 8)
 
                                 VStack(alignment: .leading, spacing: 4) {
@@ -102,6 +152,7 @@ struct GroupDetailView: View {
 
                                         Image(systemName: group.isPublic ? "globe" : "lock.fill")
                                             .foregroundColor(.secondary)
+                                            .accessibilityLabel(group.isPublic ? "Public group" : "Private group")
                                     }
 
                                     Text(presenceService.formatPresenceDisplay(for: group))
@@ -109,6 +160,23 @@ struct GroupDetailView: View {
                                         .foregroundColor(.secondary)
                                 }
                                 Spacer()
+
+                                // Favorite toggle
+                                if isJoined {
+                                    Button {
+                                        HapticManager.light()
+                                        Task {
+                                            if let groupId = group.id {
+                                                await firestoreService.toggleFavoriteGroup(groupId: groupId)
+                                            }
+                                        }
+                                    } label: {
+                                        Image(systemName: firestoreService.isGroupFavorited(groupId: group.id ?? "") ? "star.fill" : "star")
+                                            .font(.title2)
+                                            .foregroundColor(firestoreService.isGroupFavorited(groupId: group.id ?? "") ? .yellow : .secondary)
+                                    }
+                                    .accessibilityLabel(firestoreService.isGroupFavorited(groupId: group.id ?? "") ? "Remove from favorites" : "Add to favorites")
+                                }
                             }
 
                             // Check-in/out button (if joined)
@@ -127,11 +195,26 @@ struct GroupDetailView: View {
                                     .font(.headline)
                                     .frame(maxWidth: .infinity)
                                     .padding()
-                                    .background(isPresent ? Color.green : Color.blue)
+                                    .background(checkInButtonColor)
                                     .foregroundColor(.white)
                                     .cornerRadius(12)
                                 }
+                                .disabled(!canTogglePresence)
                                 .animation(.spring(response: 0.4, dampingFraction: 0.7), value: isPresent)
+                                .accessibilityLabel(isPresent ? "Checked in. Tap to check out." : "Not checked in. Tap to check in.")
+                                .accessibilityHint(checkInUnavailableReason ?? "")
+
+                                // Manual check-in only works near the group
+                                if let reason = checkInUnavailableReason {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "location.slash")
+                                            .accessibilityHidden(true)
+                                        Text(reason)
+                                    }
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .padding(.top, 4)
+                                }
 
                                 // Show auto check-out timer if active
                                 if isPresent,
@@ -140,11 +223,13 @@ struct GroupDetailView: View {
                                     HStack {
                                         Image(systemName: "timer")
                                             .foregroundColor(.orange)
+                                            .accessibilityHidden(true)
                                         Text("Auto check-out in \(formatTimeRemaining(remaining))")
                                             .font(.caption)
                                             .foregroundColor(.secondary)
                                     }
                                     .padding(.top, 4)
+                                    .accessibilityElement(children: .combine)
                                 }
                             }
                         }
@@ -172,6 +257,7 @@ struct GroupDetailView: View {
                                         Image(systemName: copiedInviteCode ? "checkmark" : "doc.on.doc")
                                             .foregroundColor(copiedInviteCode ? .green : .blue)
                                     }
+                                    .accessibilityLabel(copiedInviteCode ? "Copied" : "Copy invite code")
                                 }
 
                                 Text("Share this code to invite others to join")
@@ -198,20 +284,40 @@ struct GroupDetailView: View {
                                     .font(.headline)
 
                                 ForEach(presences) { presence in
-                                    HStack(spacing: 12) {
-                                        Circle()
-                                            .fill(Color.green)
-                                            .frame(width: 10, height: 10)
+                                    WhoIsHereRow(presence: presence)
+                                    .contextMenu {
+                                        // Only show actions for other users, not yourself
+                                        if presence.userId != Auth.auth().currentUser?.uid {
+                                            Button {
+                                                profilePresence = presence
+                                            } label: {
+                                                Label("View Profile", systemImage: "person.circle")
+                                            }
 
-                                        Text(presence.displayName ?? "Unknown")
-                                            .font(.subheadline)
+                                            Divider()
 
-                                        Spacer()
+                                            let isFriend = friendService.friends.contains(where: { $0.id == presence.userId })
+                                            let hasPendingRequest = friendService.sentRequests.contains(where: { $0.receiverId == presence.userId })
 
-                                        if presence.isManual {
-                                            Text("Manual")
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
+                                            if isFriend {
+                                                Label("Already Friends", systemImage: "person.2.fill")
+                                            } else if hasPendingRequest {
+                                                Label("Request Sent", systemImage: "person.badge.clock")
+                                            } else {
+                                                Button {
+                                                    Task {
+                                                        await sendFriendRequest(to: presence)
+                                                    }
+                                                } label: {
+                                                    Label("Send Friend Request", systemImage: "person.badge.plus")
+                                                }
+                                            }
+
+                                            Button(role: .destructive) {
+                                                reportingPresence = presence
+                                            } label: {
+                                                Label("Report User", systemImage: "flag")
+                                            }
                                         }
                                     }
                                 }
@@ -219,6 +325,11 @@ struct GroupDetailView: View {
                             .padding()
                             .background(Color(.systemBackground))
                             .cornerRadius(16)
+                        }
+
+                        // Leaderboard Preview
+                        if isJoined, let groupId = group.id {
+                            LeaderboardPreviewCard(groupId: groupId, groupName: group.name)
                         }
 
                         // Actions
@@ -236,10 +347,11 @@ struct GroupDetailView: View {
                                     .font(.headline)
                                     .frame(maxWidth: .infinity)
                                     .padding()
-                                    .background(Color.blue)
+                                    .background(networkMonitor.isConnected ? Color.blue : Color.gray)
                                     .foregroundColor(.white)
                                     .cornerRadius(12)
                                 }
+                                .disabled(!networkMonitor.isConnected)
                             } else {
                                 if isOwner {
                                     Button(action: { showSettings = true }) {
@@ -269,7 +381,7 @@ struct GroupDetailView: View {
                                     }
                                 } else {
                                     Button(action: {
-                                        print("Leave Group button tapped")
+                                        AppLogger.debug("Leave Group button tapped")
                                         showLeaveConfirmation = true
                                     }) {
                                         HStack {
@@ -302,19 +414,46 @@ struct GroupDetailView: View {
                         dismiss()
                     }
                 }
+
+                if isJoined, let inviteCode = group.inviteCode,
+                   let shareURL = DeepLinkService.shared.generateShareLink(inviteCode: inviteCode) {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        ShareLink(item: shareURL, subject: Text("Join \(group.name)"), message: Text("Join my group \"\(group.name)\" on Who's There!")) {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                        .simultaneousGesture(TapGesture().onEnded {
+                            Task { await AchievementService.shared.recordGroupShared() }
+                        })
+                    }
+                }
+
+                if isJoined && group.isPublic, let groupId = group.id,
+                   let shareURL = DeepLinkService.shared.generateGroupLink(groupId: groupId) {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        ShareLink(item: shareURL, subject: Text("Join \(group.name)"), message: Text("Join \"\(group.name)\" on Who's There!")) {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                        .simultaneousGesture(TapGesture().onEnded {
+                            Task { await AchievementService.shared.recordGroupShared() }
+                        })
+                    }
+                }
             }
         }
         .onAppear {
-            print("GroupDetailView appeared for: \(group.name)")
-            print("  - ID: \(group.id ?? "nil")")
-            print("  - Center: (\(group.centerLatitude), \(group.centerLongitude))")
-            print("  - Boundary points: \(group.boundary.count)")
-            print("  - Has valid coords: \(hasValidCoordinates)")
+            AppLogger.debug("GroupDetailView appeared for: \(group.name)")
+            AppLogger.debug("  - ID: \(group.id ?? "nil")")
+            AppLogger.debug("  - Center: (\(group.centerLatitude), \(group.centerLongitude))")
+            AppLogger.debug("  - Boundary points: \(group.boundary.count)")
+            AppLogger.debug("  - Has valid coords: \(hasValidCoordinates)")
 
             setupState()
-            Task {
-                await loadPresence()
-            }
+            // Guarantees a live listener even if this group isn't on the map/list
+            presenceService.focusPresence(on: group.id)
+            presenceService.requestRecheckIfNeeded(groupId: group.id)
+        }
+        .onDisappear {
+            presenceService.focusPresence(on: nil)
         }
         .task {
             // Refresh map after a short delay to ensure it renders
@@ -326,7 +465,26 @@ struct GroupDetailView: View {
         .sheet(isPresented: $showSettings) {
             GroupSettingsView(group: group)
         }
-        .alert("Leave LocationGroup?", isPresented: $showLeaveConfirmation) {
+        .sheet(item: $profilePresence) { presence in
+            UserProfileView(
+                userId: presence.userId,
+                displayName: presence.displayName ?? "Unknown"
+            )
+        }
+        .sheet(item: $reportingPresence) { presence in
+            ReportUserView(
+                reportedUserId: presence.userId,
+                reportedDisplayName: presence.displayName ?? "Unknown",
+                context: .presence,
+                groupId: group.id
+            )
+        }
+        .alert("Friend Request", isPresented: $showFriendRequestAlert) {
+            Button("OK") {}
+        } message: {
+            Text(friendRequestAlertMessage ?? "")
+        }
+        .alert("Leave \(group.name)?", isPresented: $showLeaveConfirmation) {
             Button("Cancel", role: .cancel) {}
             Button("Leave", role: .destructive) {
                 Task {
@@ -336,7 +494,7 @@ struct GroupDetailView: View {
         } message: {
             Text("You will no longer see this group or receive presence updates.")
         }
-        .alert("Delete LocationGroup?", isPresented: $showDeleteConfirmation) {
+        .alert("Delete \(group.name)?", isPresented: $showDeleteConfirmation) {
             Button("Cancel", role: .cancel) {}
             Button("Delete", role: .destructive) {
                 Task {
@@ -349,16 +507,16 @@ struct GroupDetailView: View {
     }
 
     private func setupState() {
-        print("setupState() called for group: \(group.name)")
-        print("Group ID: \(group.id ?? "nil")")
+        AppLogger.debug("setupState() called for group: \(group.name)")
+        AppLogger.debug("Group ID: \(group.id ?? "nil")")
 
         guard let userId = Auth.auth().currentUser?.uid else {
-            print("No user ID found")
+            AppLogger.debug("No user ID found")
             return
         }
 
-        print("User ID: \(userId)")
-        print("Group owner ID: \(group.ownerId)")
+        AppLogger.debug("User ID: \(userId)")
+        AppLogger.debug("Group owner ID: \(group.ownerId)")
 
         // Check if user is the owner
         isOwner = group.ownerId == userId
@@ -367,22 +525,12 @@ struct GroupDetailView: View {
             // Check if user has joined this group, OR if they're the owner (owner is always joined)
             let inJoinedList = firestoreService.currentUser?.joinedGroupIds.contains(groupId) ?? false
             isJoined = inJoinedList || isOwner || group.memberIds.contains(userId)
-            isPresent = presenceService.isUserPresent(groupId: groupId, userId: userId)
         } else {
             // If group.id is nil, assume joined if we're the owner
             isJoined = isOwner
         }
 
-        print("isJoined: \(isJoined), isOwner: \(isOwner), isPresent: \(isPresent)")
-    }
-
-    private func loadPresence() async {
-        guard let groupId = group.id else { return }
-        presences = await firestoreService.fetchPresenceForGroup(groupId: groupId)
-
-        if let userId = Auth.auth().currentUser?.uid {
-            isPresent = presences.contains { $0.userId == userId }
-        }
+        AppLogger.debug("isJoined: \(isJoined), isOwner: \(isOwner), isPresent: \(isPresent)")
     }
 
     private func togglePresence() async {
@@ -390,12 +538,10 @@ struct GroupDetailView: View {
 
         if isPresent {
             await presenceService.manualCheckOut(groupId: groupId)
-        } else {
-            await presenceService.manualCheckIn(groupId: groupId)
+        } else if !(await presenceService.manualCheckIn(groupId: groupId)) {
+            // Location moved out of range between showing the button and tapping it
+            HapticManager.error()
         }
-
-        isPresent.toggle()
-        await loadPresence()
     }
 
     private func joinGroup() async {
@@ -421,6 +567,19 @@ struct GroupDetailView: View {
         if case .success = result {
             dismiss()
         }
+    }
+
+    private func sendFriendRequest(to presence: Presence) async {
+        do {
+            try await FriendService.shared.sendFriendRequest(toUserId: presence.userId)
+            HapticManager.light()
+            friendRequestAlertMessage = "Friend request sent to \(presence.displayName ?? "this user")!"
+        } catch let error as FriendError {
+            friendRequestAlertMessage = error.errorDescription ?? "Could not send friend request"
+        } catch {
+            friendRequestAlertMessage = "Could not send friend request"
+        }
+        showFriendRequestAlert = true
     }
 
     private func copyInviteCode() {
@@ -457,4 +616,56 @@ struct GroupDetailView: View {
             Coordinate(latitude: 37.7749, longitude: -122.4184)
         ]
     ))
+}
+
+/// One person in the "Who's Here" list. Automatic check-ins that haven't been
+/// confirmed in the last 30 minutes are faded with "confirmed 1h ago".
+private struct WhoIsHereRow: View {
+    let presence: Presence
+
+    var body: some View {
+        // Re-evaluates the "confirmed …" label every minute
+        TimelineView(.everyMinute) { context in
+            let confirmation = presence.confirmationLabel(at: context.date)
+
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(confirmation == nil ? Color.green : Color.orange)
+                    .frame(width: 10, height: 10)
+                    .accessibilityHidden(true)
+
+                if let level = presence.level, level > 0 {
+                    LevelBadge(level: level)
+                }
+
+                Text(presence.displayName ?? "Unknown")
+                    .font(.subheadline)
+
+                Spacer()
+
+                if presence.isManual {
+                    Text("Manual")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else if let confirmation {
+                    Text(confirmation)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .opacity(confirmation == nil ? 1 : 0.6)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(accessibilityText(confirmation: confirmation))
+        }
+    }
+
+    private func accessibilityText(confirmation: String?) -> String {
+        var text = "\(presence.displayName ?? "Unknown") is here"
+        if presence.isManual {
+            text += ", manual check-in"
+        } else if let confirmation {
+            text += ", \(confirmation)"
+        }
+        return text
+    }
 }

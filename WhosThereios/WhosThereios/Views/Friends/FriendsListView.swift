@@ -174,9 +174,12 @@ struct FriendRow: View {
                 Circle()
                     .fill(.green)
                     .frame(width: 10, height: 10)
+                    .accessibilityLabel("At a location")
             }
         }
         .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(friend.displayName ?? "Unknown")\(isAtLocation ? ", at a location" : "")")
     }
 }
 
@@ -201,6 +204,7 @@ struct FriendAtLocationRow: View {
                         Circle()
                             .stroke(.green, lineWidth: 3)
                     }
+                    .accessibilityHidden(true)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(presence.displayName)
@@ -210,8 +214,7 @@ struct FriendAtLocationRow: View {
                     // Show locations
                     ForEach(presence.currentGroups) { group in
                         HStack(spacing: 4) {
-                            Text(group.groupEmoji)
-                                .font(.caption)
+                            GroupIconView(icon: group.groupEmoji, size: 12)
                             Text(group.groupName)
                                 .font(.caption)
                                 .foregroundColor(.secondary)

@@ -17,6 +17,7 @@ class AchievementService: ObservableObject {
     private let db = Firestore.firestore()
     private var firestoreService: FirestoreService { FirestoreService.shared }
     private var analyticsService: AnalyticsService { AnalyticsService.shared }
+    private var levelService: LevelService { LevelService.shared }
 
     @Published var earnedAchievements: [UserAchievement] = []
     @Published var userStats: UserStats = UserStats()
@@ -38,6 +39,7 @@ class AchievementService: ObservableObject {
                     self?.earnedAchievements = []
                     self?.userStats = UserStats()
                     self?.totalPoints = 0
+                    LevelService.shared.reset()
                 }
             }
         }
@@ -51,6 +53,9 @@ class AchievementService: ObservableObject {
         await loadEarnedAchievements(userId: userId)
         await loadUserStats(userId: userId)
         calculateTotalPoints()
+
+        // Initialize level service with current stats
+        levelService.loadFromStats(userStats, achievementPoints: totalPoints)
     }
 
     private func loadEarnedAchievements(userId: String) async {
@@ -64,7 +69,7 @@ class AchievementService: ObservableObject {
                 try? doc.data(as: UserAchievement.self)
             }
         } catch {
-            print("Error loading achievements: \(error)")
+            AppLogger.debug("Error loading achievements: \(error)")
         }
     }
 
@@ -82,7 +87,7 @@ class AchievementService: ObservableObject {
                 try? await saveUserStats()
             }
         } catch {
-            print("Error loading user stats: \(error)")
+            AppLogger.debug("Error loading user stats: \(error)")
         }
     }
 
@@ -107,11 +112,14 @@ class AchievementService: ObservableObject {
     // MARK: - Event Triggers
 
     /// Call when user checks in to a location
-    func recordCheckIn(groupId: String, presentMembers: [Presence]) async {
+    func recordCheckIn(groupId: String, presentMembers: [Presence], friendIds: [String] = []) async {
         guard let userId = Auth.auth().currentUser?.uid else { return }
 
         // Update stats
         userStats.totalCheckIns += 1
+
+        // Per-group check-in count
+        userStats.groupCheckInCounts[groupId, default: 0] += 1
 
         // Check if first to arrive TODAY (early bird) - must be first person of the day at this location
         let isFirstToday = await checkIfFirstArrivalToday(groupId: groupId, userId: userId)
@@ -130,13 +138,23 @@ class AchievementService: ObservableObject {
         // Update streak
         updateStreak()
 
-        // Check for night owl (after 10 PM)
-        let hour = Calendar.current.component(.hour, from: Date())
+        // Time-of-day checks
+        let now = Date()
+        let calendar = Calendar.current
+        let hour = calendar.component(.hour, from: now)
         let isNightOwl = hour >= 22 || hour < 5
 
         // Check for weekend warrior
-        let weekday = Calendar.current.component(.weekday, from: Date())
+        let weekday = calendar.component(.weekday, from: now)
         checkWeekendWarrior(weekday: weekday)
+
+        // Update habit tracker for Creature of Habit
+        updateHabitTracker(groupId: groupId, hour: hour)
+
+        // Count friends present for Crew Up
+        let friendsPresent = presentMembers.filter { presence in
+            presence.userId != userId && friendIds.contains(presence.userId)
+        }
 
         // Save stats
         try? await saveUserStats()
@@ -146,9 +164,28 @@ class AchievementService: ObservableObject {
         await checkEarlyBirdAchievements()
         await checkSocialAchievements()
         await checkStreakAchievements()
+        await checkPerGroupAchievements(groupId: groupId)
+        await checkTimeBasedAchievements(hour: hour)
+        await checkSeasonalAchievements(date: now)
+        await checkHabitAchievements()
 
         if isNightOwl {
             await tryUnlock(.nightOwl)
+        }
+
+        // Crew Up: 3+ friends checked in together
+        if friendsPresent.count >= 3 {
+            await tryUnlock(.crewUp)
+        }
+    }
+
+    /// Call after leaderboard update to check if user is now #1 visitor
+    func checkTopVisitor(groupId: String) async {
+        guard let topEntry = await FirestoreService.shared.fetchTopVisitor(groupId: groupId),
+              topEntry.userId == Auth.auth().currentUser?.uid else { return }
+        // Only unlock if they have at least 3 check-ins this month (meaningful lead)
+        if topEntry.effectiveMonthlyCheckIns >= 3 {
+            await tryUnlock(.topVisitor)
         }
     }
 
@@ -164,11 +201,148 @@ class AchievementService: ObservableObject {
         userStats.groupsJoined += 1
         try? await saveUserStats()
         await checkExplorerAchievements()
+
+        // Popular Kid: 5+ groups
+        if userStats.groupsJoined >= 5 {
+            await tryUnlock(.popularKid)
+        }
     }
 
     /// Call when a group's member count changes (for group owner)
     func recordGroupMemberCountChanged(memberCount: Int) async {
         await checkCommunityAchievements(memberCount: memberCount)
+    }
+
+    /// Call when user checks out of a location
+    func recordCheckOut(groupId: String, remainingMembers: Int, sessionDurationMinutes: Int) async {
+        // Marathon: 4+ hours
+        if sessionDurationMinutes >= 240 {
+            userStats.longestSessionMinutes = max(userStats.longestSessionMinutes, sessionDurationMinutes)
+            try? await saveUserStats()
+            await tryUnlock(.marathonSession)
+        }
+
+        // Last One Standing: no other users remain
+        if remainingMembers == 0 {
+            userStats.wasLastToLeaveCount += 1
+            try? await saveUserStats()
+            await tryUnlock(.lastOneStanding)
+        }
+    }
+
+    /// Call when friend count changes
+    func recordFriendCountChanged(friendCount: Int) async {
+        userStats.friendCount = friendCount
+        try? await saveUserStats()
+
+        if friendCount >= 1 {
+            await tryUnlock(.firstFriend)
+        }
+        if friendCount >= 10 {
+            await tryUnlock(.friendCollector)
+        }
+    }
+
+    /// Call when user sends a friend request
+    func recordFriendRequestSent() async {
+        userStats.hasSentFriendRequest = true
+        try? await saveUserStats()
+        await tryUnlock(.friendlyFace)
+    }
+
+    /// Call when user accepts a friend request
+    func recordFriendRequestAccepted() async {
+        userStats.hasAcceptedFriendRequest = true
+        try? await saveUserStats()
+        await tryUnlock(.welcomeCommittee)
+    }
+
+    /// Call when user sets their display name
+    func recordDisplayNameSet() async {
+        userStats.hasSetDisplayName = true
+        try? await saveUserStats()
+        await tryUnlock(.identitySet)
+    }
+
+    /// Call when user views group settings
+    func recordGroupSettingsViewed() async {
+        userStats.hasViewedGroupSettings = true
+        try? await saveUserStats()
+        await tryUnlock(.settingsExplorer)
+    }
+
+    /// Call when user favorites/unfavorites a group
+    func recordFavoriteCountChanged(count: Int) async {
+        userStats.favoriteGroupCount = count
+        try? await saveUserStats()
+        if count >= 4 {
+            await tryUnlock(.favoritesFan)
+        }
+    }
+
+    /// Call when user shares a group invite link
+    func recordGroupShared() async {
+        userStats.hasSharedGroupLink = true
+        try? await saveUserStats()
+        await tryUnlock(.shareTheLove)
+    }
+
+    /// Call when user shares the app
+    func recordAppShared() async {
+        userStats.hasSharedApp = true
+        try? await saveUserStats()
+        await tryUnlock(.appAmbassador)
+    }
+
+    /// Call when user joins a private group via invite code
+    func recordPrivateGroupJoined() async {
+        userStats.hasJoinedPrivateGroup = true
+        try? await saveUserStats()
+        await tryUnlock(.privateEntry)
+    }
+
+    /// Call when user sends a chat message
+    func recordMessageSent(groupId: String, isFirstMessageInGroup: Bool) async {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+
+        // Reset daily count if new day
+        if let lastDate = userStats.lastMessageDate {
+            let lastDay = calendar.startOfDay(for: lastDate)
+            if today != lastDay {
+                userStats.messagesToday = 0
+            }
+        }
+
+        userStats.totalMessagesSent += 1
+        userStats.messagesToday += 1
+        userStats.lastMessageDate = Date()
+
+        if isFirstMessageInGroup && !userStats.groupsWithFirstMessage.contains(groupId) {
+            userStats.groupsWithFirstMessage.append(groupId)
+        }
+
+        try? await saveUserStats()
+
+        // Conversation Starter
+        if isFirstMessageInGroup {
+            await tryUnlock(.conversationStarter)
+        }
+
+        // Chatterbox: 50 total messages
+        if userStats.totalMessagesSent >= 50 {
+            await tryUnlock(.chatterbox)
+        }
+
+        // Prolific Messenger: 10 messages in one day
+        if userStats.messagesToday >= 10 {
+            await tryUnlock(.prolificMessenger)
+        }
+
+        // First Message: send any message
+        if userStats.totalMessagesSent >= 1 {
+            await tryUnlock(.firstMessage)
+        }
     }
 
     // MARK: - Achievement Checks
@@ -207,6 +381,9 @@ class AchievementService: ObservableObject {
         if userStats.groupsCreated >= 1 {
             await tryUnlock(.groupCreator)
         }
+        if userStats.groupsCreated >= 3 {
+            await tryUnlock(.tripleBuilder)
+        }
     }
 
     private func checkCommunityAchievements(memberCount: Int) async {
@@ -215,6 +392,7 @@ class AchievementService: ObservableObject {
         }
         if memberCount >= 10 {
             await tryUnlock(.socialHub)
+            await tryUnlock(.landlord)
         }
     }
 
@@ -243,6 +421,9 @@ class AchievementService: ObservableObject {
     }
 
     private func checkStreakAchievements() async {
+        if userStats.currentStreak >= 3 {
+            await tryUnlock(.onARoll)
+        }
         if userStats.currentStreak >= 7 {
             await tryUnlock(.weekWarrior)
         }
@@ -278,6 +459,106 @@ class AchievementService: ObservableObject {
 
         userStats.lastCheckInDate = Date()
         userStats.longestStreak = max(userStats.longestStreak, userStats.currentStreak)
+    }
+
+    // MARK: - New Achievement Checks
+
+    private func checkPerGroupAchievements(groupId: String) async {
+        let count = userStats.groupCheckInCounts[groupId] ?? 0
+        if count >= 20 {
+            await tryUnlock(.homebody)
+        }
+        if count >= 30 {
+            await tryUnlock(.loyalMember)
+        }
+    }
+
+    private func checkTimeBasedAchievements(hour: Int) async {
+        if hour < 7 {
+            await tryUnlock(.earlyRiser)
+        }
+        if hour >= 23 {
+            await tryUnlock(.lateNightOwl)
+        }
+        if hour == 0 {
+            await tryUnlock(.midnightCrew)
+        }
+    }
+
+    private func checkSeasonalAchievements(date: Date) async {
+        let calendar = Calendar.current
+        let month = calendar.component(.month, from: date)
+        let day = calendar.component(.day, from: date)
+
+        // New Year's Day
+        if month == 1 && day == 1 {
+            await tryUnlock(.newYearCheckIn)
+        }
+
+        // Major holidays
+        if isMajorHoliday(month: month, day: day) {
+            await tryUnlock(.holidaySpirit)
+        }
+    }
+
+    private func checkHabitAchievements() async {
+        for (_, entry) in userStats.habitTracker {
+            if entry.consecutiveDays >= 5 {
+                await tryUnlock(.creatureOfHabit)
+                return
+            }
+        }
+    }
+
+    private func isMajorHoliday(month: Int, day: Int) -> Bool {
+        let holidays: [(Int, Int)] = [
+            (1, 1),   // New Year's Day
+            (2, 14),  // Valentine's Day
+            (7, 4),   // Independence Day
+            (10, 31), // Halloween
+            (12, 25), // Christmas
+            (12, 31), // New Year's Eve
+        ]
+        return holidays.contains { $0.0 == month && $0.1 == day }
+    }
+
+    private func updateHabitTracker(groupId: String, hour: Int) {
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+
+        if var entry = userStats.habitTracker[groupId] {
+            // Check if same hour (within 1 hour tolerance)
+            let sameHour = abs(entry.lastCheckInHour - hour) <= 1
+
+            if let lastDate = entry.lastCheckInDate {
+                let lastDay = calendar.startOfDay(for: lastDate)
+                let daysDiff = calendar.dateComponents([.day], from: lastDay, to: today).day ?? 0
+
+                if daysDiff == 1 && sameHour {
+                    // Consecutive day, same hour
+                    entry.consecutiveDays += 1
+                } else if daysDiff == 0 {
+                    // Same day, don't update
+                    return
+                } else {
+                    // Streak broken or different hour
+                    entry.consecutiveDays = 1
+                }
+            } else {
+                entry.consecutiveDays = 1
+            }
+
+            entry.lastCheckInHour = hour
+            entry.lastCheckInDate = Date()
+            userStats.habitTracker[groupId] = entry
+        } else {
+            // First time at this group
+            userStats.habitTracker[groupId] = HabitEntry(
+                lastCheckInHour: hour,
+                consecutiveDays: 1,
+                lastCheckInDate: Date()
+            )
+        }
     }
 
     private func checkWeekendWarrior(weekday: Int) {
@@ -334,6 +615,9 @@ class AchievementService: ObservableObject {
             newlyUnlockedAchievement = achievement
             calculateTotalPoints()
 
+            // Award XP for achievement
+            await levelService.awardAchievementXP(points: achievement.points)
+
             // Haptic feedback for achievement unlock
             HapticManager.success()
 
@@ -343,7 +627,7 @@ class AchievementService: ObservableObject {
                 points: achievement.points
             )
 
-            print("Achievement unlocked: \(achievement.displayName)")
+            AppLogger.debug("Achievement unlocked: \(achievement.displayName)")
 
             // Clear the notification after a delay
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
@@ -352,7 +636,7 @@ class AchievementService: ObservableObject {
                 }
             }
         } catch {
-            print("Error saving achievement: \(error)")
+            AppLogger.debug("Error saving achievement: \(error)")
         }
     }
 
@@ -398,7 +682,7 @@ class AchievementService: ObservableObject {
         } catch {
             // Permission errors usually mean user is not recognized as a group member yet
             // This can happen due to timing/caching issues - just skip the achievement check
-            print("[AchievementService] Error checking first arrival for group \(groupId): \(error.localizedDescription)")
+            AppLogger.debug("[AchievementService] Error checking first arrival for group \(groupId): \(error.localizedDescription)")
             return false
         }
     }
@@ -427,6 +711,8 @@ class AchievementService: ObservableObject {
 
         case .groupCreator:
             return (min(userStats.groupsCreated, 1), 1)
+        case .tripleBuilder:
+            return (min(userStats.groupsCreated, 3), 3)
 
         case .explorer:
             return (min(userStats.groupsJoined, 3), 3)
@@ -434,6 +720,8 @@ class AchievementService: ObservableObject {
             return (min(userStats.groupsJoined, 5), 5)
         case .globetrotter:
             return (min(userStats.groupsJoined, 10), 10)
+        case .popularKid:
+            return (min(userStats.groupsJoined, 5), 5)
 
         case .socialButterfly:
             return (min(userStats.uniquePeopleMetCount, 5), 5)
@@ -442,6 +730,8 @@ class AchievementService: ObservableObject {
         case .connector:
             return (min(userStats.uniquePeopleMetCount, 25), 25)
 
+        case .onARoll:
+            return (min(userStats.currentStreak, 3), 3)
         case .weekWarrior:
             return (min(userStats.currentStreak, 7), 7)
         case .dedicated:
@@ -449,7 +739,38 @@ class AchievementService: ObservableObject {
         case .unstoppable:
             return (min(userStats.currentStreak, 30), 30)
 
-        default:
+        case .firstFriend:
+            return (min(userStats.friendCount, 1), 1)
+        case .friendCollector:
+            return (min(userStats.friendCount, 10), 10)
+
+        case .chatterbox:
+            return (min(userStats.totalMessagesSent, 50), 50)
+        case .prolificMessenger:
+            return (min(userStats.messagesToday, 10), 10)
+
+        case .homebody:
+            let maxCount = userStats.groupCheckInCounts.values.max() ?? 0
+            return (min(maxCount, 20), 20)
+        case .loyalMember:
+            let maxCount = userStats.groupCheckInCounts.values.max() ?? 0
+            return (min(maxCount, 30), 30)
+
+        case .creatureOfHabit:
+            let maxConsecutive = userStats.habitTracker.values.map(\.consecutiveDays).max() ?? 0
+            return (min(maxConsecutive, 5), 5)
+
+        case .favoritesFan:
+            return (min(userStats.favoriteGroupCount, 4), 4)
+
+        // One-time trigger achievements (no meaningful progress bar)
+        case .nightOwl, .weekendWarrior, .earlyRiser, .lateNightOwl,
+             .lastOneStanding, .marathonSession, .crewUp,
+             .conversationStarter, .midnightCrew, .holidaySpirit,
+             .newYearCheckIn, .communityBuilder, .socialHub, .landlord,
+             .friendlyFace, .welcomeCommittee, .identitySet, .settingsExplorer,
+             .shareTheLove, .appAmbassador, .privateEntry, .firstMessage,
+             .topVisitor:
             return nil
         }
     }
