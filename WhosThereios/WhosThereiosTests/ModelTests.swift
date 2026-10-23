@@ -538,3 +538,59 @@ final class AutoPresenceDeciderTests: XCTestCase {
         XCTAssertEqual(decide(.unknown, AutoPresenceState(isAutoCheckedIn: true), exitSignal: true), .none)
     }
 }
+
+final class ManualCheckInAvailabilityTests: XCTestCase {
+
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    /// Same ~100m square; top edge at 34.0009
+    private let group = LocationGroup(
+        id: "group1",
+        name: "Test",
+        isPublic: false,
+        ownerId: "owner",
+        boundary: [
+            Coordinate(latitude: 34.0000, longitude: -119.0000),
+            Coordinate(latitude: 34.0009, longitude: -119.0000),
+            Coordinate(latitude: 34.0009, longitude: -118.9989),
+            Coordinate(latitude: 34.0000, longitude: -118.9989)
+        ]
+    )
+
+    private func fix(metersNorth: Double, accuracy: Double, age: TimeInterval = 5) -> CLLocation {
+        CLLocation(
+            coordinate: CLLocationCoordinate2D(latitude: 34.0009 + metersNorth / 111_320, longitude: -118.9995),
+            altitude: 0,
+            horizontalAccuracy: accuracy,
+            verticalAccuracy: -1,
+            timestamp: now.addingTimeInterval(-age)
+        )
+    }
+
+    func testInsideIsAllowed() {
+        XCTAssertEqual(ManualCheckInAvailability.evaluate(group: group, location: fix(metersNorth: -20, accuracy: 10), now: now), .allowed)
+    }
+
+    func testWithin200mIsAllowed() {
+        XCTAssertEqual(ManualCheckInAvailability.evaluate(group: group, location: fix(metersNorth: 180, accuracy: 10), now: now), .allowed)
+    }
+
+    func testFarAwayIsRefusedWithRealDistance() {
+        let result = ManualCheckInAvailability.evaluate(group: group, location: fix(metersNorth: 1_000, accuracy: 10), now: now)
+        guard case .tooFar(let meters) = result else {
+            return XCTFail("Expected tooFar, got \(result)")
+        }
+        XCTAssertEqual(meters, 1_000, accuracy: 5)
+    }
+
+    func testHugeAccuracyOnlyEarnsLimitedAllowance() {
+        // 400m away with a 3km "reduced accuracy" fix: only 100m is credited
+        let result = ManualCheckInAvailability.evaluate(group: group, location: fix(metersNorth: 400, accuracy: 3_000), now: now)
+        XCTAssertNotEqual(result, .allowed)
+    }
+
+    func testMissingOrOldLocationIsNoLocation() {
+        XCTAssertEqual(ManualCheckInAvailability.evaluate(group: group, location: nil, now: now), .noLocation)
+        XCTAssertEqual(ManualCheckInAvailability.evaluate(group: group, location: fix(metersNorth: 0, accuracy: 10, age: 600), now: now), .noLocation)
+    }
+}

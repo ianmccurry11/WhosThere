@@ -43,6 +43,31 @@ struct GroupDetailView: View {
         return presences.contains { $0.userId == userId }
     }
 
+    /// Checking out always works; checking in only near the group
+    private var canTogglePresence: Bool {
+        isPresent || presenceService.manualCheckInAvailability(for: group) == .allowed
+    }
+
+    private var checkInButtonColor: Color {
+        if isPresent { return .green }
+        return canTogglePresence ? .blue : .gray
+    }
+
+    /// Why Check In is disabled, or nil when it isn't
+    private var checkInUnavailableReason: String? {
+        guard !isPresent else { return nil }
+        switch presenceService.manualCheckInAvailability(for: group) {
+        case .allowed:
+            return nil
+        case .noLocation:
+            return "Finding your location…"
+        case .tooFar(let meters):
+            let distance = Measurement(value: meters, unit: UnitLength.meters)
+                .formatted(.measurement(width: .abbreviated, usage: .road))
+            return "You need to be at \(group.name) to check in (\(distance) away)"
+        }
+    }
+
     /// Check if the group has valid coordinates for display
     private var hasValidCoordinates: Bool {
         let lat = group.centerLatitude
@@ -170,12 +195,26 @@ struct GroupDetailView: View {
                                     .font(.headline)
                                     .frame(maxWidth: .infinity)
                                     .padding()
-                                    .background(isPresent ? Color.green : Color.blue)
+                                    .background(checkInButtonColor)
                                     .foregroundColor(.white)
                                     .cornerRadius(12)
                                 }
+                                .disabled(!canTogglePresence)
                                 .animation(.spring(response: 0.4, dampingFraction: 0.7), value: isPresent)
                                 .accessibilityLabel(isPresent ? "Checked in. Tap to check out." : "Not checked in. Tap to check in.")
+                                .accessibilityHint(checkInUnavailableReason ?? "")
+
+                                // Manual check-in only works near the group
+                                if let reason = checkInUnavailableReason {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "location.slash")
+                                            .accessibilityHidden(true)
+                                        Text(reason)
+                                    }
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .padding(.top, 4)
+                                }
 
                                 // Show auto check-out timer if active
                                 if isPresent,
@@ -445,7 +484,7 @@ struct GroupDetailView: View {
         } message: {
             Text(friendRequestAlertMessage ?? "")
         }
-        .alert("Leave LocationGroup?", isPresented: $showLeaveConfirmation) {
+        .alert("Leave \(group.name)?", isPresented: $showLeaveConfirmation) {
             Button("Cancel", role: .cancel) {}
             Button("Leave", role: .destructive) {
                 Task {
@@ -455,7 +494,7 @@ struct GroupDetailView: View {
         } message: {
             Text("You will no longer see this group or receive presence updates.")
         }
-        .alert("Delete LocationGroup?", isPresented: $showDeleteConfirmation) {
+        .alert("Delete \(group.name)?", isPresented: $showDeleteConfirmation) {
             Button("Cancel", role: .cancel) {}
             Button("Delete", role: .destructive) {
                 Task {
@@ -499,8 +538,9 @@ struct GroupDetailView: View {
 
         if isPresent {
             await presenceService.manualCheckOut(groupId: groupId)
-        } else {
-            await presenceService.manualCheckIn(groupId: groupId)
+        } else if !(await presenceService.manualCheckIn(groupId: groupId)) {
+            // Location moved out of range between showing the button and tapping it
+            HapticManager.error()
         }
     }
 

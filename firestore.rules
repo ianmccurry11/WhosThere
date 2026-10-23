@@ -282,13 +282,19 @@ service cloud.firestore {
     // ============================================
 
     match /presence/{groupId} {
-      // Allow read if user can access the parent group
-      allow read: if isAuthenticated();
+      // Who's at a group is visible to its members, or to anyone for public groups
+      function canSeeGroupPresence() {
+        let group = get(/databases/$(database)/documents/groups/$(groupId)).data;
+        return isAuthenticated()
+          && (group.isPublic == true || userId() in group.memberIds);
+      }
+
+      allow read: if canSeeGroupPresence();
 
       match /members/{memberId} {
         // Users can only read presence for groups they're members of
         // or public groups
-        allow read: if isAuthenticated();
+        allow read: if canSeeGroupPresence();
 
         // Users can only write their own presence
         allow create, update: if isOwner(memberId)
@@ -297,10 +303,10 @@ service cloud.firestore {
           && request.resource.data.isPresent is bool
           && request.resource.data.isManual is bool;
 
-        // Anyone signed in may clear someone else's check-in once it has
+        // Anyone who can see the group may clear someone else's check-in once it has
         // lapsed (past expiresAt, or not updated in 5 hours), so stale
         // entries get cleaned up without a server. Mirrors Presence.isActive.
-        allow update: if isAuthenticated()
+        allow update: if canSeeGroupPresence()
           && resource.data.isPresent == true
           && (('expiresAt' in resource.data && resource.data.expiresAt < request.time)
               || resource.data.lastUpdated < request.time - duration.value(5, 'h'))

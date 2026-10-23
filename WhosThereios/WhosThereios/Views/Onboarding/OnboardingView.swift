@@ -40,7 +40,7 @@ struct OnboardingView: View {
         OnboardingPage(
             image: "location.circle.fill",
             title: "Always Allow (Recommended)",
-            description: "For automatic check-ins even when the app is closed, enable 'Always' location access. This enables background geofencing for a seamless experience.",
+            description: "For automatic check-ins even when the app is closed, choose 'Always' and keep Precise Location on so you're matched to the right spot.",
             color: .appBlue
         )
     ]

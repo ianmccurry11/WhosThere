@@ -29,6 +29,9 @@ struct HomeView: View {
     @State private var notificationGroup: LocationGroup?
     @State private var deepLinkPreviewGroup: LocationGroup?
     @State private var dismissedNameBanner = false
+    @State private var showLocationSetup = false
+    /// The location setup sheet opens by itself only once; after that the banner offers it
+    @AppStorage("hasShownLocationSetup") private var hasShownLocationSetup = false
 
     var body: some View {
         NavigationStack {
@@ -45,7 +48,7 @@ struct HomeView: View {
                         StatusBanner(
                             message: warning,
                             type: .warning,
-                            action: openAppSettings,
+                            action: { showLocationSetup = true },
                             actionLabel: "Fix"
                         )
                         .transition(.move(edge: .top).combined(with: .opacity))
@@ -191,7 +194,16 @@ struct HomeView: View {
             await initializeData()
         }
         .onAppear {
-            locationService.requestAuthorization()
+            if needsLocationSetup && !hasShownLocationSetup {
+                // Explain why before iOS asks, instead of a bare permission prompt
+                hasShownLocationSetup = true
+                showLocationSetup = true
+            } else if locationService.authorizationStatus == .notDetermined {
+                locationService.requestAuthorization()
+            }
+        }
+        .sheet(isPresented: $showLocationSetup) {
+            LocationSetupView()
         }
         .onReceive(NotificationCenter.default.publisher(for: .openGroup)) { notification in
             if let groupId = notification.userInfo?["groupId"] as? String {
@@ -264,10 +276,9 @@ struct HomeView: View {
         }
     }
 
-    private func openAppSettings() {
-        if let url = URL(string: UIApplication.openSettingsURLString) {
-            UIApplication.shared.open(url)
-        }
+    /// Automatic check-in needs "Always" and Precise Location
+    private var needsLocationSetup: Bool {
+        locationService.authorizationStatus != .authorizedAlways || !locationService.hasPreciseLocation
     }
 
     private var showNameNudge: Bool {

@@ -43,6 +43,38 @@ enum PresencePolicy {
     static let minRegionRadius: CLLocationDistance = 150
     /// Radius of the "you moved, refresh the nearest geofences" ring
     static let refreshRingRadius: CLLocationDistance = 1_500
+
+    // MARK: Manual check-in
+
+    /// Manual check-in only works this close to a group's boundary
+    static let manualCheckInDistance: CLLocationDistance = 200
+    /// At most this much GPS error is credited towards being close enough
+    static let manualCheckInAccuracyAllowance: CLLocationDistance = 100
+    /// Locations older than this don't count for manual check-in
+    static let manualCheckInLocationMaxAge: TimeInterval = 2 * 60
+}
+
+/// Whether the user can check in by hand at a group right now
+enum ManualCheckInAvailability: Equatable {
+    case allowed
+    /// Too far away; the distance in meters from the group's boundary
+    case tooFar(CLLocationDistance)
+    /// No recent location to check against
+    case noLocation
+
+    /// Manual check-in only works near the group, so nobody can appear
+    /// somewhere they aren't (or earn leaderboard spots for it)
+    static func evaluate(group: LocationGroup, location: CLLocation?, now: Date = Date()) -> ManualCheckInAvailability {
+        guard let location,
+              location.horizontalAccuracy >= 0,
+              now.timeIntervalSince(location.timestamp) <= PresencePolicy.manualCheckInLocationMaxAge else {
+            return .noLocation
+        }
+        let distance = group.distanceToBoundary(from: location.coordinate)
+        // Give the benefit of the doubt for GPS error, within reason
+        let allowance = min(location.horizontalAccuracy, PresencePolicy.manualCheckInAccuracyAllowance)
+        return distance - allowance <= PresencePolicy.manualCheckInDistance ? .allowed : .tooFar(distance)
+    }
 }
 
 /// Where a location fix puts the user relative to a group's boundary

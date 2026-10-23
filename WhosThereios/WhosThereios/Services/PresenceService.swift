@@ -187,7 +187,27 @@ class PresenceService: ObservableObject {
 
     // MARK: - Manual Check-in/out
 
-    func manualCheckIn(groupId: String) async {
+    /// Whether the Check In button should work right now, from the latest location
+    func manualCheckInAvailability(for group: LocationGroup) -> ManualCheckInAvailability {
+        ManualCheckInAvailability.evaluate(group: group, location: locationService.currentLocation)
+    }
+
+    /// Checks in by hand. Refused (returns false) when the user isn't near the
+    /// group, e.g. a request from the watch or a screen left open after leaving.
+    @discardableResult
+    func manualCheckIn(groupId: String) async -> Bool {
+        if let group = firestoreService.joinedGroups.first(where: { $0.id == groupId }) {
+            let location = await locationService.requestFreshLocation(
+                maxAge: PresencePolicy.manualCheckInLocationMaxAge,
+                timeout: 10
+            )
+            let availability = ManualCheckInAvailability.evaluate(group: group, location: location)
+            guard availability == .allowed else {
+                AppLogger.debug("[PresenceService] manualCheckIn refused for \(group.name): \(availability)")
+                return false
+            }
+        }
+
         manualOverrides[groupId] = true
         suppressedGroupIds.remove(groupId)
         checkInTimes[groupId] = Date()
@@ -215,6 +235,7 @@ class PresenceService: ObservableObject {
         // Timer will be cancelled if user enters the geofence zone (geofencing takes over)
         AppLogger.debug("[PresenceService] manualCheckIn - Starting timer for \(autoCheckOutMinutes) minutes")
         startAutoCheckOutTimer(groupId: groupId)
+        return true
     }
 
     func manualCheckOut(groupId: String) async {
