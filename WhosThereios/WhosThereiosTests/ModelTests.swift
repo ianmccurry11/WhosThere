@@ -594,3 +594,28 @@ final class ManualCheckInAvailabilityTests: XCTestCase {
         XCTAssertEqual(ManualCheckInAvailability.evaluate(group: group, location: fix(metersNorth: 0, accuracy: 10, age: 600), now: now), .noLocation)
     }
 }
+
+final class AppVersionTests: XCTestCase {
+
+    func testOlderPatchVersion() {
+        XCTAssertTrue(AppVersion.isVersion("1.2.4", olderThan: "1.2.5"))
+    }
+
+    func testSameVersionIsNotOlder() {
+        XCTAssertFalse(AppVersion.isVersion("1.2.5", olderThan: "1.2.5"))
+    }
+
+    func testNewerVersionIsNotOlder() {
+        XCTAssertFalse(AppVersion.isVersion("1.3.0", olderThan: "1.2.5"))
+    }
+
+    func testComparesNumbersNotText() {
+        XCTAssertTrue(AppVersion.isVersion("1.2.9", olderThan: "1.2.10"))
+        XCTAssertFalse(AppVersion.isVersion("1.10", olderThan: "1.9"))
+    }
+
+    func testMissingComponentsCountAsZero() {
+        XCTAssertFalse(AppVersion.isVersion("1.2", olderThan: "1.2.0"))
+        XCTAssertTrue(AppVersion.isVersion("1.2", olderThan: "1.2.1"))
+    }
+}

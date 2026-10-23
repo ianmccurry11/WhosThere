@@ -335,6 +335,17 @@ service cloud.firestore {
     }
 
     // ============================================
+    // APP CONFIG (e.g. minimumVersion for forced updates)
+    // ============================================
+    // Readable before sign-in so outdated apps can be blocked on the first
+    // screen; only editable from the Firebase console.
+
+    match /config/{configId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ============================================
     // COUNTERS COLLECTION (for sequential IDs)
     // ============================================
 
